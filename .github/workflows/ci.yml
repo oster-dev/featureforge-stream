@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: Python 3.11 baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Create project environment
+        run: python -m venv .venv
+
+      - name: Install package and development dependencies
+        run: .venv/bin/python -m pip install -e ".[dev]"
+
+      - name: Check dependency compatibility
+        run: .venv/bin/python -m pip check
+
+      - name: Verify package import
+        run: |
+          .venv/bin/python -c \
+            "import featureforge_stream; print(featureforge_stream.__file__)"
+
+      - name: Run local quality gate
+        run: make check
+
+      - name: Check tracked-file whitespace
+        run: git show --format= --check HEAD

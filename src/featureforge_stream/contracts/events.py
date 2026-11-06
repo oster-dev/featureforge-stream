@@ -75,3 +75,9 @@ class InteractionEventV1(BaseModel):
             raise ValueError("impression events must have play_seconds equal to zero")
 
         return self
+
+
+def validate_event_json(payload: str) -> str:
+    """Validate one interaction event and return normalized JSON."""
+    event = InteractionEventV1.model_validate_json(payload)
+    return event.model_dump_json()

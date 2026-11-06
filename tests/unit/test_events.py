@@ -7,7 +7,10 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from featureforge_stream.contracts.events import InteractionEventV1
+from featureforge_stream.contracts.events import (
+    InteractionEventV1,
+    validate_event_json,
+)
 
 
 @pytest.fixture
@@ -187,3 +190,21 @@ def test_prevents_normal_field_assignment(valid_payload: dict[str, object]) -> N
 
     with pytest.raises(ValidationError, match="frozen"):
         event.play_seconds = 100
+
+
+def test_validate_event_json_returns_normalized_event(
+    valid_payload: dict[str, object],
+) -> None:
+    valid_payload["event_time"] = "2026-01-01T12:00:00+02:00"
+    valid_payload["ingested_at"] = "2026-01-01T12:01:00+02:00"
+
+    result = json.loads(validate_event_json(json.dumps(valid_payload)))
+
+    assert result["event_time"] == "2026-01-01T10:00:00Z"
+    assert result["ingested_at"] == "2026-01-01T10:01:00Z"
+    assert result["event_id"] == valid_payload["event_id"]
+
+
+def test_validate_event_json_rejects_invalid_payload() -> None:
+    with pytest.raises(ValidationError):
+        validate_event_json('{"event_type": "unsupported"}')

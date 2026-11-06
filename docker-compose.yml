@@ -74,8 +74,8 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.host: taskmanager
-        taskmanager.numberOfTaskSlots: 1
-        taskmanager.memory.process.size: 1728m
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.memory.process.size: 3456m
         parallelism.default: 1
         python.client.executable: /opt/pyflink/bin/python
         python.executable: /opt/pyflink/bin/python

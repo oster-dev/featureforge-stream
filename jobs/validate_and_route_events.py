@@ -1,16 +1,24 @@
-"""Route valid and invalid Kafka event JSON into separate outputs."""
+"""Validate Kafka events and write valid and rejected records separately."""
 
 from pyflink.common import Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import (
+    DeliveryGuarantee,
     KafkaOffsetsInitializer,
+    KafkaRecordSerializationSchema,
+    KafkaSink,
     KafkaSource,
 )
 from pyflink.datastream.functions import ProcessFunction
 from pyflink.datastream.output_tag import OutputTag
 
 from featureforge_stream.contracts.routing import route_event_json
+
+BOOTSTRAP_SERVERS = "kafka:29092"
+INPUT_TOPIC = "interaction-events.v1"
+VALIDATED_TOPIC = "interaction-events.validated.v1"
+REJECTED_TOPIC = "interaction-events.rejected.v1"
 
 INVALID_EVENTS = OutputTag("invalid-events-v1", Types.STRING())
 
@@ -27,15 +35,34 @@ class ValidateAndRoute(ProcessFunction):
             yield INVALID_EVENTS, rejected
 
 
+def kafka_sink(topic: str) -> KafkaSink:
+    return (
+        KafkaSink.builder()
+        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(topic)
+            .set_value_serialization_schema(SimpleStringSchema())
+            .build()
+        )
+        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+        .build()
+    )
+
+
 def main() -> None:
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
+    # Checkpointing is required for reliable source-offset recovery and for
+    # Kafka sink delivery guarantees.
+    env.enable_checkpointing(10_000)
+
     source = (
         KafkaSource.builder()
-        .set_bootstrap_servers("kafka:29092")
-        .set_topics("interaction-events.v1")
-        .set_group_id("featureforge-stream-routing-smoke-v1")
+        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
+        .set_topics(INPUT_TOPIC)
+        .set_group_id("featureforge-stream-validation-v1")
         .set_starting_offsets(KafkaOffsetsInitializer.earliest())
         .set_value_only_deserializer(SimpleStringSchema())
         .build()
@@ -52,10 +79,12 @@ def main() -> None:
         output_type=Types.STRING(),
     ).name("validate-and-route-interaction-event-v1")
 
-    valid.print("valid-event")
-    valid.get_side_output(INVALID_EVENTS).print("rejected-event")
+    valid.sink_to(kafka_sink(VALIDATED_TOPIC)).name("validated-events-sink")
+    valid.get_side_output(INVALID_EVENTS).sink_to(kafka_sink(REJECTED_TOPIC)).name(
+        "rejected-events-sink"
+    )
 
-    env.execute("featureforge-stream-routing-smoke")
+    env.execute("featureforge-stream-validation")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
-"""The validation job separates valid and rejected Kafka records."""
+"""Verify validation routing using records unique to each test run."""
 
 import json
 import subprocess
 import time
-import uuid
+from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -18,22 +19,26 @@ VALIDATED_TOPIC = "interaction-events.validated.v1"
 REJECTED_TOPIC = "interaction-events.rejected.v1"
 
 
-def run_kafka(script: str, *arguments: str) -> str:
-    command = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "kafka",
-        f"/opt/kafka/bin/{script}",
-        *arguments,
-    ]
-
+def run_kafka(
+    script: str,
+    *arguments: str,
+    input_text: str | None = None,
+) -> str:
     result = subprocess.run(
-        command,
+        [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "kafka",
+            f"/opt/kafka/bin/{script}",
+            *arguments,
+        ],
+        input=input_text,
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     return result.stdout
 
@@ -54,7 +59,18 @@ def create_topic(topic: str) -> None:
     )
 
 
-def read_records(topic: str) -> list[str]:
+def produce_records(*records: str) -> None:
+    run_kafka(
+        "kafka-console-producer.sh",
+        "--bootstrap-server",
+        BOOTSTRAP_SERVERS,
+        "--topic",
+        INPUT_TOPIC,
+        input_text="\n".join(records) + "\n",
+    )
+
+
+def read_records(topic: str) -> list[dict]:
     output = run_kafka(
         "kafka-console-consumer.sh",
         "--bootstrap-server",
@@ -63,17 +79,18 @@ def read_records(topic: str) -> list[str]:
         topic,
         "--from-beginning",
         "--timeout-ms",
-        "5000",
+        "3000",
     )
 
-    return [line for line in output.splitlines() if line.strip()]
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
 
 
 def wait_for_record(
     topic: str,
-    predicate,
-    timeout_seconds: int = 30,
-) -> str:
+    predicate: Callable[[dict], bool],
+    *,
+    timeout_seconds: int = 45,
+) -> dict:
     deadline = time.monotonic() + timeout_seconds
 
     while time.monotonic() < deadline:
@@ -81,81 +98,51 @@ def wait_for_record(
             if predicate(record):
                 return record
 
-        time.sleep(1)
+        time.sleep(0.5)
 
-    raise AssertionError(f"No matching record found in topic {topic!r}")
-
-
-def produce_records(*records: str) -> None:
-    subprocess.run(
-        [
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "kafka",
-            "/opt/kafka/bin/kafka-console-producer.sh",
-            "--bootstrap-server",
-            BOOTSTRAP_SERVERS,
-            "--topic",
-            INPUT_TOPIC,
-        ],
-        input="\n".join(records) + "\n",
-        check=True,
-        capture_output=True,
-        text=True,
+    raise AssertionError(
+        f"No matching record found in {topic!r} "
+        f"within the polling period of {timeout_seconds} seconds"
     )
 
 
 @pytest.mark.integration
 def test_valid_and_invalid_records_are_written_to_separate_topics() -> None:
-    create_topic(INPUT_TOPIC)
-    create_topic(VALIDATED_TOPIC)
-    create_topic(REJECTED_TOPIC)
+    for topic in (INPUT_TOPIC, VALIDATED_TOPIC, REJECTED_TOPIC):
+        create_topic(topic)
 
-    fixture_event = json.loads(FIXTURE_PATH.read_text(encoding="utf-8").splitlines()[0])
+    fixture_payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8").splitlines()[0])
 
-    first_event_id = str(uuid.uuid4())
-    first_event = {
-        **fixture_event,
-        "event_id": first_event_id,
-        "user_id": f"integration-user-{first_event_id[:8]}",
-    }
-    invalid_payload = '{"broken":'
+    first_event = InteractionEventV1.model_validate({**fixture_payload, "event_id": str(uuid4())})
+    second_event = InteractionEventV1.model_validate({**fixture_payload, "event_id": str(uuid4())})
 
-    produce_records(json.dumps(first_event), invalid_payload)
+    run_id = str(uuid4())
+    invalid_payload = f'{{"integration_run":"{run_id}","broken":'
 
-    validated_record = wait_for_record(
+    produce_records(
+        first_event.model_dump_json(),
+        invalid_payload,
+        second_event.model_dump_json(),
+    )
+
+    first_result = wait_for_record(
         VALIDATED_TOPIC,
-        lambda record: first_event_id in record,
+        lambda record: record.get("event_id") == str(first_event.event_id),
     )
-    rejected_record = wait_for_record(
+    rejection = wait_for_record(
         REJECTED_TOPIC,
-        lambda record: (
-            record.startswith("{") and json.loads(record).get("raw_payload") == invalid_payload
-        ),
+        lambda record: record.get("raw_payload") == invalid_payload,
+    )
+    second_result = wait_for_record(
+        VALIDATED_TOPIC,
+        lambda record: record.get("event_id") == str(second_event.event_id),
     )
 
-    InteractionEventV1.model_validate_json(validated_record)
-    assert json.loads(validated_record)["event_id"] == first_event_id
+    assert InteractionEventV1.model_validate(first_result) == first_event
+    assert InteractionEventV1.model_validate(second_result) == second_event
 
-    rejection = json.loads(rejected_record)
+    assert rejection["error_schema_version"] == "v1"
     assert rejection["reason_code"] == "INVALID_JSON"
     assert rejection["raw_payload"] == invalid_payload
-
-    second_event_id = str(uuid.uuid4())
-    second_event = {
-        **fixture_event,
-        "event_id": second_event_id,
-        "user_id": f"integration-user-{second_event_id[:8]}",
-    }
-
-    produce_records(json.dumps(second_event))
-
-    second_validated_record = wait_for_record(
-        VALIDATED_TOPIC,
-        lambda record: second_event_id in record,
-    )
-
-    InteractionEventV1.model_validate_json(second_validated_record)
-    assert json.loads(second_validated_record)["event_id"] == second_event_id
+    assert rejection["errors"]
+    assert any(error["type"] == "json_invalid" for error in rejection["errors"])

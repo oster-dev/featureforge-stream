@@ -1,4 +1,4 @@
-"""Compare the running Flink feature job with the golden reference."""
+"""Verify golden feature values and late-event window corrections."""
 
 import json
 import subprocess
@@ -183,3 +183,91 @@ def test_golden_fixture_matches_flink_feature_values() -> None:
 
         window_start = datetime.fromisoformat(feature["window_start_exclusive"])
         assert window_start == observation_time - timedelta(hours=1)
+
+
+@pytest.mark.integration
+def test_late_event_corrects_previously_emitted_feature() -> None:
+    """A late play updates an emitted window within allowed lateness."""
+    namespace = uuid4()
+    user_id = f"integration_late_{namespace.hex}"
+
+    # Stay ahead of the golden test's progress event on the shared job.
+    observation_time = datetime.now(UTC).replace(second=0, microsecond=0) + timedelta(minutes=15)
+    initial_time = observation_time - timedelta(minutes=1)
+    late_time = observation_time - timedelta(seconds=30)
+    progress_time = observation_time + timedelta(minutes=11)
+
+    initial_event = InteractionEventV1.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_time": initial_time,
+            "ingested_at": initial_time,
+            "user_id": user_id,
+            "content_id": "content_late_integration",
+            "event_type": "play",
+            "play_seconds": 30,
+            "source": "web",
+            "schema_version": "v1",
+        }
+    )
+
+    progress_event = InteractionEventV1.model_validate(
+        {
+            **initial_event.model_dump(),
+            "event_id": uuid4(),
+            "event_time": progress_time,
+            "ingested_at": progress_time,
+            "user_id": f"integration_late_progress_{namespace.hex}",
+            "event_type": "skip",
+            "play_seconds": 0,
+        }
+    )
+
+    # The progress event advances the watermark past the target window end.
+    produce_events([initial_event, progress_event])
+
+    initial_features = wait_for_features(
+        observation_time=observation_time,
+        expected={user_id: 1},
+    )
+    initial_feature = initial_features[user_id]
+
+    assert initial_feature["feature_schema_version"] == "v1"
+    assert initial_feature["feature_name"] == "user_play_count_1h"
+    assert initial_feature["play_count"] == 1
+    assert datetime.fromisoformat(
+        initial_feature["window_start_exclusive"]
+    ) == observation_time - timedelta(hours=1)
+
+    # Submit only after the initial window output has been observed.
+    late_event = InteractionEventV1.model_validate(
+        {
+            **initial_event.model_dump(),
+            "event_id": uuid4(),
+            "event_time": late_time,
+            "ingested_at": progress_time + timedelta(seconds=1),
+            "play_seconds": 45,
+        }
+    )
+
+    expected_count = count_user_plays_1h(
+        [initial_event, late_event],
+        user_id=user_id,
+        observation_time=observation_time,
+    )
+    assert expected_count == 2
+
+    produce_events([late_event])
+
+    corrected_features = wait_for_features(
+        observation_time=observation_time,
+        expected={user_id: expected_count},
+    )
+    corrected_feature = corrected_features[user_id]
+
+    assert corrected_feature["feature_schema_version"] == "v1"
+    assert corrected_feature["feature_name"] == "user_play_count_1h"
+    assert corrected_feature["user_id"] == initial_feature["user_id"]
+    assert corrected_feature["observation_time"] == initial_feature["observation_time"]
+    assert corrected_feature["window_start_exclusive"] == initial_feature["window_start_exclusive"]
+    assert corrected_feature["play_count"] == 2

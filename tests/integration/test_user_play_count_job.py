@@ -1,4 +1,4 @@
-"""Verify golden feature values, late corrections, and duplicate handling."""
+"""Verify golden values, late corrections, duplicates, and too-late routing."""
 
 import json
 import subprocess
@@ -343,3 +343,107 @@ def test_late_event_corrects_previously_emitted_feature() -> None:
         observation_time=observation_time,
         expected_count=expected_after_duplicate,
     )
+
+
+@pytest.mark.integration
+def test_event_too_late_for_all_windows_is_routed() -> None:
+    """Route a valid event after every assigned window has expired."""
+    late_topic = "interaction-events.user-play-count-1h.late.v1"
+    namespace = uuid4()
+    probe_user = f"integration_too_late_probe_{namespace.hex}"
+
+    observation_time = datetime.now(UTC).replace(second=0, microsecond=0) + timedelta(minutes=15)
+    probe_time = observation_time - timedelta(minutes=1)
+    progress_time = observation_time + timedelta(minutes=11)
+
+    probe_event = InteractionEventV1.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_time": probe_time,
+            "ingested_at": probe_time,
+            "user_id": probe_user,
+            "content_id": "content_too_late_integration",
+            "event_type": "play",
+            "play_seconds": 30,
+            "source": "web",
+            "schema_version": "v1",
+        }
+    )
+
+    progress_event = InteractionEventV1.model_validate(
+        {
+            **probe_event.model_dump(),
+            "event_id": uuid4(),
+            "event_time": progress_time,
+            "ingested_at": progress_time,
+            "user_id": f"integration_too_late_progress_{namespace.hex}",
+            "event_type": "skip",
+            "play_seconds": 0,
+        }
+    )
+
+    # Observe an event-time window output before sending the old event.
+    produce_events([probe_event, progress_event])
+
+    probe_features = wait_for_features(
+        observation_time=observation_time,
+        expected={probe_user: 1},
+    )
+    assert probe_features[probe_user]["play_count"] == 1
+
+    # All assigned one-hour windows and their 30-minute retention period
+    # have expired by the watermark already demonstrated above.
+    old_event_time = observation_time - timedelta(hours=2)
+    old_event = InteractionEventV1.model_validate(
+        {
+            **probe_event.model_dump(),
+            "event_id": uuid4(),
+            "event_time": old_event_time,
+            "ingested_at": progress_time + timedelta(seconds=1),
+            "user_id": f"integration_too_late_{namespace.hex}",
+        }
+    )
+
+    produce_events([old_event])
+
+    deadline = time.monotonic() + 60
+    matched_record = None
+
+    while time.monotonic() < deadline:
+        output = run_kafka(
+            "kafka-console-consumer.sh",
+            "--bootstrap-server",
+            BOOTSTRAP_SERVERS,
+            "--topic",
+            late_topic,
+            "--from-beginning",
+            "--timeout-ms",
+            "3000",
+        )
+
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+
+            record = json.loads(line)
+            raw_payload = record.get("raw_payload")
+            if not isinstance(raw_payload, str):
+                continue
+
+            original_payload = json.loads(raw_payload)
+            if original_payload.get("event_id") == str(old_event.event_id):
+                matched_record = record
+                break
+
+        if matched_record is not None:
+            break
+
+        time.sleep(0.5)
+
+    assert matched_record is not None, (
+        f"No late-event record found in {late_topic!r} for event_id={old_event.event_id}"
+    )
+    assert matched_record["error_schema_version"] == "v1"
+    assert matched_record["reason_code"] == "TOO_LATE_FOR_ALL_ASSIGNED_WINDOWS"
+    assert matched_record["feature_name"] == "user_play_count_1h"
+    assert InteractionEventV1.model_validate_json(matched_record["raw_payload"]) == old_event

@@ -1,4 +1,4 @@
-"""Verify golden feature values and late-event window corrections."""
+"""Verify golden feature values, late corrections, and duplicate handling."""
 
 import json
 import subprocess
@@ -105,6 +105,33 @@ def wait_for_features(
     )
 
 
+def assert_no_excess_play_count(
+    *,
+    user_id: str,
+    observation_time: datetime,
+    expected_count: int,
+    duration_seconds: int = 10,
+) -> None:
+    """Reject any excessive count observed during a bounded polling period."""
+    deadline = time.monotonic() + duration_seconds
+
+    while time.monotonic() < deadline:
+        for record in read_features():
+            if record.get("user_id") != user_id:
+                continue
+
+            record_time = datetime.fromisoformat(record["observation_time"])
+            if record_time != observation_time:
+                continue
+
+            assert record["play_count"] <= expected_count, (
+                "Duplicate delivery increased the feature value: "
+                f"expected at most {expected_count}, record={record}"
+            )
+
+        time.sleep(0.5)
+
+
 @pytest.mark.integration
 def test_golden_fixture_matches_flink_feature_values() -> None:
     fixture_events = [
@@ -187,7 +214,7 @@ def test_golden_fixture_matches_flink_feature_values() -> None:
 
 @pytest.mark.integration
 def test_late_event_corrects_previously_emitted_feature() -> None:
-    """A late play updates an emitted window within allowed lateness."""
+    """Correct an emitted window and ignore a repeated late-event delivery."""
     namespace = uuid4()
     user_id = f"integration_late_{namespace.hex}"
 
@@ -271,3 +298,48 @@ def test_late_event_corrects_previously_emitted_feature() -> None:
     assert corrected_feature["observation_time"] == initial_feature["observation_time"]
     assert corrected_feature["window_start_exclusive"] == initial_feature["window_start_exclusive"]
     assert corrected_feature["play_count"] == 2
+
+    # Repeat the exact late event, then send a distinct play as a positive probe.
+    next_event = InteractionEventV1.model_validate(
+        {
+            **initial_event.model_dump(),
+            "event_id": uuid4(),
+            "event_time": observation_time - timedelta(seconds=15),
+            "ingested_at": progress_time + timedelta(seconds=2),
+            "play_seconds": 60,
+        }
+    )
+
+    assert next_event.event_id not in {
+        initial_event.event_id,
+        late_event.event_id,
+    }
+
+    # The reference is computed from the three distinct logical events.
+    expected_after_duplicate = count_user_plays_1h(
+        [initial_event, late_event, next_event],
+        user_id=user_id,
+        observation_time=observation_time,
+    )
+    assert expected_after_duplicate == 3
+
+    produce_events([late_event, next_event])
+
+    final_features = wait_for_features(
+        observation_time=observation_time,
+        expected={user_id: expected_after_duplicate},
+    )
+    final_feature = final_features[user_id]
+
+    assert final_feature["feature_schema_version"] == "v1"
+    assert final_feature["feature_name"] == "user_play_count_1h"
+    assert final_feature["user_id"] == initial_feature["user_id"]
+    assert final_feature["observation_time"] == initial_feature["observation_time"]
+    assert final_feature["window_start_exclusive"] == initial_feature["window_start_exclusive"]
+    assert final_feature["play_count"] == 3
+
+    assert_no_excess_play_count(
+        user_id=user_id,
+        observation_time=observation_time,
+        expected_count=expected_after_duplicate,
+    )

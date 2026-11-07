@@ -1,4 +1,4 @@
-"""Validated Redis storage with observation-time guarded writes."""
+"""Redis storage for append-only user play counts with guarded writes."""
 
 from datetime import UTC, timedelta
 from typing import Literal
@@ -15,10 +15,6 @@ from redis import Redis
 from redis.exceptions import WatchError
 
 WriteResult = Literal["written", "unchanged", "stale"]
-
-
-class FeatureWriteConflictError(ValueError):
-    """Different values target the same observation window."""
 
 
 class UserPlayCountFeatureV1(BaseModel):
@@ -53,11 +49,14 @@ class UserPlayCountFeatureV1(BaseModel):
 
 
 class RedisUserPlayCountStore:
-    """Store one feature per user with guarded transactional updates.
+    """Maintain the latest window and its largest observed play count.
 
-    Older observation windows cannot replace newer ones. Identical retries
-    are no-ops. Different values for the same window are explicit conflicts
-    until a correction-ordering contract is introduced.
+    This policy is specific to append-only counts without retractions:
+    newer windows replace older ones, while counts for the same window
+    can only increase. Identical deliveries do not change the value.
+
+    This is not a general revision policy for arbitrary features and
+    cannot repair an already inflated count.
 
     The caller owns the Redis client's connection lifecycle.
     """
@@ -94,7 +93,7 @@ class RedisUserPlayCountStore:
         return feature
 
     def write(self, feature: UserPlayCountFeatureV1) -> WriteResult:
-        """Compare and write using optimistic locking.
+        """Apply window ordering and monotone same-window corrections.
 
         Retry at most 16 times when concurrent writers change the key.
         Connection errors and exhausted retries propagate to the caller.
@@ -119,15 +118,13 @@ class RedisUserPlayCountStore:
                             return "stale"
 
                         if feature.observation_time == stored.observation_time:
-                            if feature == stored:
+                            if feature.play_count < stored.play_count:
+                                pipeline.unwatch()
+                                return "stale"
+
+                            if feature.play_count == stored.play_count:
                                 pipeline.unwatch()
                                 return "unchanged"
-
-                            raise FeatureWriteConflictError(
-                                "Different feature values for the same observation_time: "
-                                f"user_id={feature.user_id!r}, "
-                                f"observation_time={feature.observation_time.isoformat()}"
-                            )
 
                     pipeline.multi()
                     pipeline.set(key, payload)

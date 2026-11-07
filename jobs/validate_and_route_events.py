@@ -1,8 +1,10 @@
-"""Validate Kafka events and write valid and rejected records separately."""
+"""Validate Kafka events in continuous or bounded replay mode."""
+
+import argparse
 
 from pyflink.common import Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.datastream import RuntimeExecutionMode, StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import (
     DeliveryGuarantee,
     KafkaOffsetsInitializer,
@@ -35,10 +37,10 @@ class ValidateAndRoute(ProcessFunction):
             yield INVALID_EVENTS, rejected
 
 
-def kafka_sink(topic: str) -> KafkaSink:
+def kafka_sink(topic: str, *, bootstrap_servers: str) -> KafkaSink:
     return (
         KafkaSink.builder()
-        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
+        .set_bootstrap_servers(bootstrap_servers)
         .set_record_serializer(
             KafkaRecordSerializationSchema.builder()
             .set_topic(topic)
@@ -50,26 +52,48 @@ def kafka_sink(topic: str) -> KafkaSink:
     )
 
 
-def main() -> None:
-    env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(1)
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate interaction events and route rejected records."
+    )
+    parser.add_argument("--bootstrap-servers", default=BOOTSTRAP_SERVERS)
+    parser.add_argument("--input-topic", default=INPUT_TOPIC)
+    parser.add_argument("--validated-topic", default=VALIDATED_TOPIC)
+    parser.add_argument("--rejected-topic", default=REJECTED_TOPIC)
+    parser.add_argument(
+        "--group-id",
+        default="featureforge-stream-validation-v1",
+    )
+    parser.add_argument(
+        "--job-name",
+        default="featureforge-stream-validation",
+    )
+    parser.add_argument("--bounded", action="store_true")
+    return parser.parse_args()
 
-    # Checkpointing is required for reliable source-offset recovery and for
-    # Kafka sink delivery guarantees.
+
+def main() -> None:
+    arguments = parse_arguments()
+
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
+    env.set_parallelism(1)
     env.enable_checkpointing(10_000)
 
-    source = (
+    source_builder = (
         KafkaSource.builder()
-        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
-        .set_topics(INPUT_TOPIC)
-        .set_group_id("featureforge-stream-validation-v1")
+        .set_bootstrap_servers(arguments.bootstrap_servers)
+        .set_topics(arguments.input_topic)
+        .set_group_id(arguments.group_id)
         .set_starting_offsets(KafkaOffsetsInitializer.earliest())
         .set_value_only_deserializer(SimpleStringSchema())
-        .build()
     )
 
+    if arguments.bounded:
+        source_builder.set_bounded(KafkaOffsetsInitializer.latest())
+
     stream = env.from_source(
-        source,
+        source_builder.build(),
         WatermarkStrategy.no_watermarks(),
         "interaction-events-source",
     )
@@ -79,12 +103,21 @@ def main() -> None:
         output_type=Types.STRING(),
     ).name("validate-and-route-interaction-event-v1")
 
-    valid.sink_to(kafka_sink(VALIDATED_TOPIC)).name("validated-events-sink")
-    valid.get_side_output(INVALID_EVENTS).sink_to(kafka_sink(REJECTED_TOPIC)).name(
-        "rejected-events-sink"
-    )
+    valid.sink_to(
+        kafka_sink(
+            arguments.validated_topic,
+            bootstrap_servers=arguments.bootstrap_servers,
+        )
+    ).name("validated-events-sink")
 
-    env.execute("featureforge-stream-validation")
+    valid.get_side_output(INVALID_EVENTS).sink_to(
+        kafka_sink(
+            arguments.rejected_topic,
+            bootstrap_servers=arguments.bootstrap_servers,
+        )
+    ).name("rejected-events-sink")
+
+    env.execute(arguments.job_name)
 
 
 if __name__ == "__main__":

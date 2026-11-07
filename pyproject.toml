@@ -19,6 +19,10 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.9,<1",
 ]
+replay = [
+    "confluent-kafka>=2.6,<3",
+    "pyarrow>=18,<23",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

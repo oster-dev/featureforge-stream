@@ -1,4 +1,4 @@
-"""Verify guarded feature writes against the local Redis service."""
+"""Verify guarded append-only feature writes against local Redis."""
 
 import os
 from collections.abc import Iterator
@@ -9,7 +9,6 @@ import pytest
 from redis import Redis
 
 from featureforge_stream.online_store import (
-    FeatureWriteConflictError,
     RedisUserPlayCountStore,
     UserPlayCountFeatureV1,
 )
@@ -74,18 +73,15 @@ def test_feature_round_trip(
 def test_unknown_user_returns_none(
     online_store: RedisUserPlayCountStore,
 ) -> None:
-    actual = online_store.read(f"unknown_user_{uuid4().hex}")
-
-    assert actual is None
+    assert online_store.read(f"unknown_user_{uuid4().hex}") is None
 
 
 @pytest.mark.integration
-def test_newer_window_replaces_stored_feature(
+def test_newer_window_can_replace_count_with_zero(
     online_store: RedisUserPlayCountStore,
 ) -> None:
     user_id = f"integration_user_{uuid4().hex}"
     observation_time = datetime(2026, 1, 1, 12, tzinfo=UTC)
-
     initial = make_feature(
         user_id=user_id,
         play_count=3,
@@ -93,7 +89,7 @@ def test_newer_window_replaces_stored_feature(
     )
     newer = make_feature(
         user_id=user_id,
-        play_count=1,
+        play_count=0,
         observation_time=observation_time + timedelta(minutes=1),
     )
 
@@ -108,7 +104,6 @@ def test_older_window_cannot_replace_newer_feature(
 ) -> None:
     user_id = f"integration_user_{uuid4().hex}"
     observation_time = datetime(2026, 1, 1, 12, tzinfo=UTC)
-
     current = make_feature(
         user_id=user_id,
         play_count=3,
@@ -144,31 +139,61 @@ def test_identical_delivery_is_unchanged(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("conflicting_count", [2, 4])
-def test_same_window_with_different_value_is_explicit_conflict(
+@pytest.mark.parametrize(
+    ("incoming_count", "expected_result", "expected_count"),
+    [
+        (2, "stale", 3),
+        (4, "written", 4),
+    ],
+)
+def test_same_window_accepts_only_increasing_corrections(
     online_store: RedisUserPlayCountStore,
-    conflicting_count: int,
+    incoming_count: int,
+    expected_result: str,
+    expected_count: int,
 ) -> None:
     user_id = f"integration_user_{uuid4().hex}"
     observation_time = datetime(2026, 1, 1, 12, tzinfo=UTC)
-
     initial = make_feature(
         user_id=user_id,
         play_count=3,
         observation_time=observation_time,
     )
-    conflicting = make_feature(
+    incoming = make_feature(
         user_id=user_id,
-        play_count=conflicting_count,
+        play_count=incoming_count,
+        observation_time=observation_time,
+    )
+    expected = make_feature(
+        user_id=user_id,
+        play_count=expected_count,
         observation_time=observation_time,
     )
 
     assert online_store.write(initial) == "written"
+    assert online_store.write(incoming) == expected_result
+    assert online_store.read(user_id) == expected
 
-    with pytest.raises(
-        FeatureWriteConflictError,
-        match="Different feature values for the same observation_time",
-    ):
-        online_store.write(conflicting)
 
-    assert online_store.read(user_id) == initial
+@pytest.mark.integration
+def test_replayed_previous_value_cannot_undo_late_correction(
+    online_store: RedisUserPlayCountStore,
+) -> None:
+    user_id = f"integration_user_{uuid4().hex}"
+    observation_time = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    initial = make_feature(
+        user_id=user_id,
+        play_count=1,
+        observation_time=observation_time,
+    )
+    corrected = make_feature(
+        user_id=user_id,
+        play_count=2,
+        observation_time=observation_time,
+    )
+
+    assert online_store.write(initial) == "written"
+    assert online_store.write(corrected) == "written"
+    assert online_store.write(initial) == "stale"
+    assert online_store.write(corrected) == "unchanged"
+    assert online_store.read(user_id) == corrected

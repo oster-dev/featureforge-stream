@@ -1,12 +1,13 @@
-"""Compute user_play_count_1h at minute-aligned observation times."""
+"""Compute user_play_count_1h in continuous or bounded replay mode."""
 
+import argparse
 import json
 from datetime import UTC, datetime, timedelta
 
 from pyflink.common import Duration, Time, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.watermark_strategy import TimestampAssigner
-from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.datastream import RuntimeExecutionMode, StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import (
     DeliveryGuarantee,
     KafkaOffsetsInitializer,
@@ -149,10 +150,10 @@ def late_event_record(payload: str) -> str:
     )
 
 
-def kafka_sink(topic: str) -> KafkaSink:
+def kafka_sink(topic: str, *, bootstrap_servers: str) -> KafkaSink:
     return (
         KafkaSink.builder()
-        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
+        .set_bootstrap_servers(bootstrap_servers)
         .set_record_serializer(
             KafkaRecordSerializationSchema.builder()
             .set_topic(topic)
@@ -164,23 +165,48 @@ def kafka_sink(topic: str) -> KafkaSink:
     )
 
 
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compute minute-aligned user_play_count_1h features."
+    )
+    parser.add_argument("--bootstrap-servers", default=BOOTSTRAP_SERVERS)
+    parser.add_argument("--input-topic", default=INPUT_TOPIC)
+    parser.add_argument("--feature-topic", default=FEATURE_TOPIC)
+    parser.add_argument("--late-topic", default=LATE_TOPIC)
+    parser.add_argument(
+        "--group-id",
+        default="featureforge-stream-user-play-count-1h-v1",
+    )
+    parser.add_argument(
+        "--job-name",
+        default="featureforge-stream-user-play-count-1h",
+    )
+    parser.add_argument("--bounded", action="store_true")
+    return parser.parse_args()
+
+
 def main() -> None:
+    arguments = parse_arguments()
+
     env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
     env.set_parallelism(1)
     env.enable_checkpointing(10_000)
 
-    source = (
+    source_builder = (
         KafkaSource.builder()
-        .set_bootstrap_servers(BOOTSTRAP_SERVERS)
-        .set_topics(INPUT_TOPIC)
-        .set_group_id("featureforge-stream-user-play-count-1h-v1")
+        .set_bootstrap_servers(arguments.bootstrap_servers)
+        .set_topics(arguments.input_topic)
+        .set_group_id(arguments.group_id)
         .set_starting_offsets(KafkaOffsetsInitializer.earliest())
         .set_value_only_deserializer(SimpleStringSchema())
-        .build()
     )
 
+    if arguments.bounded:
+        source_builder.set_bounded(KafkaOffsetsInitializer.latest())
+
     raw_events = env.from_source(
-        source,
+        source_builder.build(),
         WatermarkStrategy.no_watermarks(),
         "validated-interaction-events-source",
     )
@@ -218,14 +244,24 @@ def main() -> None:
         .uid("user-play-count-1h-windows-v1")
     )
 
-    features.sink_to(kafka_sink(FEATURE_TOPIC)).name("user-play-count-1h-kafka-sink")
+    features.sink_to(
+        kafka_sink(
+            arguments.feature_topic,
+            bootstrap_servers=arguments.bootstrap_servers,
+        )
+    ).name("user-play-count-1h-kafka-sink")
 
     features.get_side_output(LATE_EVENTS).map(
         late_event_record,
         output_type=Types.STRING(),
-    ).sink_to(kafka_sink(LATE_TOPIC)).name("late-events-kafka-sink")
+    ).sink_to(
+        kafka_sink(
+            arguments.late_topic,
+            bootstrap_servers=arguments.bootstrap_servers,
+        )
+    ).name("late-events-kafka-sink")
 
-    env.execute("featureforge-stream-user-play-count-1h")
+    env.execute(arguments.job_name)
 
 
 if __name__ == "__main__":

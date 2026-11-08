@@ -425,28 +425,95 @@ This prevents a stale writer from overwriting a newer concurrent update.
 
 ## Replay mode
 
-The system supports two execution modes.
+The system supports continuous processing and bounded historical replay.
 
 | Mode | Purpose |
 |---|---|
-| Continuous streaming | Normal operational processing |
-| Bounded replay | Controlled replay of a finite Kafka range |
+| Continuous streaming | Process arriving records without a fixed input end |
+| Bounded replay | Process a finite input range captured when the stage starts |
 
-Bounded mode is enabled with:
+### Stage ordering
+
+Both Flink jobs support `--bounded`. Their Kafka sources start at the earliest
+available offsets and capture stopping offsets when the source initializes.
+
+For an isolated historical run:
+
+1. Create dedicated replay topics with the timestamp policy below.
+2. Publish the complete adapted source dataset.
+3. Run validation and wait for `FINISHED`.
+4. Verify validated and rejected output ranges.
+5. Run feature computation and wait for `FINISHED`.
+6. Verify feature and late-event output ranges.
+7. Materialize feature output into an isolated Redis prefix.
+8. Compare expected latest Kafka feature values with Redis.
+
+Starting a bounded downstream stage before its upstream output is complete can
+capture an incomplete range.
+
+### Materializer boundary and commits
+
+The Redis materializer supports one partition. It captures the partition end
+offset at startup and starts from the group's committed offset, when available,
+or the earliest available offset otherwise.
+
+It rejects a topic with no readable records. For a non-empty range already
+consumed by the group, bounded mode returns without processing additional
+records.
+
+Kafka offsets are committed after successful Redis processing, including
+guarded no-op outcomes (`unchanged` or `stale`). A failure after a Redis write
+but before an offset commit can cause that update to be delivered again.
+
+The current implementation has no overall or idle-progress timeout. Bounded
+mode defines an offset boundary, not a guaranteed wall-clock completion time.
+If records stop arriving before that boundary is reached, polling can continue
+indefinitely.
+
+### Kafka timestamps and retention
+
+For local historical replay topics, use:
 
 ```text
---bounded
+cleanup.policy=delete
+retention.ms=604800000
+message.timestamp.type=LogAppendTime
 ```
 
-In bounded mode:
+Apply this policy when creating replay topics, including feature and late-event
+outputs. The seven-day retention is a local demonstration policy, not a
+universal production recommendation.
 
-- Kafka consumption stops at the topic end offset observed at startup.
-- The materializer stops after processing the available range.
-- The materializer does not wait indefinitely for new records.
-- Offsets are committed only after successful Redis writes.
+Kafka's record timestamp is transport metadata. With `LogAppendTime`, it is
+set from broker append time. JSON timestamps retain their original meanings:
 
-Bounded replay is useful for validating the pipeline against a known historical
-dataset without treating the run as a permanent streaming deployment.
+- `event_time`: interaction occurrence time.
+- `ingested_at`: original platform input receipt time.
+- `observation_time`: feature window observation time.
+
+The current Flink feature job explicitly extracts event time from the payload.
+Changing the Kafka record timestamp policy therefore does not change its
+declared feature-window membership.
+
+A local replay using `CreateTime` produced historical output timestamps.
+Broker logs confirmed that time-based retention deleted the feature and
+late-event output before materialization. The validated source remained
+readable, so only feature computation needed to be repeated into new output
+topics.
+
+Check earliest and latest offsets together. Equal offsets indicate an empty
+readable range; an end offset alone is not a retained-record count. Already
+deleted records cannot be recovered by changing retention settings.
+
+### Verification boundaries
+
+Comparing latest Kafka feature values with Redis proves materialization
+consistency for the checked run. It does not establish batch-stream parity,
+checkpoint recovery, or end-to-end exactly-once delivery.
+
+Accelerated replay retains source timestamps and arrival order. Watermark
+scheduling can affect late-event admission. Replay ordering alone does not
+establish deterministic admission across executions.
 
 ## Kafka topology
 
@@ -581,13 +648,13 @@ guarantees over vague production claims.
 | `contracts/events.py` | Defines and validates `InteractionEventV1` |
 | `contracts/routing.py` | Separates valid events from structured rejections |
 | `contracts/feature_time.py` | Maps event time to Flink window-assignment timestamps |
-| `reference/admission.py` | Defines watermark and allowed-lateness admission semantics |
+| `reference/admission.py` | Simplified arrival-order admission reference; not an exact Flink sliding-window simulation |
 | `reference/user_play_count.py` | Defines the deterministic feature reference |
-| `jobs/validate_events.py` | Runs the Kafka validation job |
-| `jobs/user_play_count.py` | Runs the Flink feature job |
+| `jobs/validate_and_route_events.py` | Runs the Kafka validation job |
+| `jobs/user_play_count_1h.py` | Runs the Flink feature job |
 | `materialize.py` | Materializes Kafka feature updates into Redis |
 | `online_store.py` | Defines the feature contract and guarded Redis store |
-| `replay/featureforge_adapter.py` | Adapts FeatureForge Parquet events for Kafka replay |
+| `replay.py` | Adapts FeatureForge Parquet events for Kafka replay |
 
 ## Extension path
 

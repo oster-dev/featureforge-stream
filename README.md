@@ -435,15 +435,32 @@ When running from the host, use:
   --group-id featureforge-stream-redis-materializer-v1
 ```
 
-For a bounded replay:
+For an isolated bounded replay, set the feature topic and Redis namespace
+explicitly:
 
 ```bash
 .venv/bin/python -m featureforge_stream.materialize \
   --bootstrap-servers 127.0.0.1:9092 \
   --redis-url redis://127.0.0.1:6379/0 \
-  --group-id featureforge-stream-redis-materializer-v1 \
+  --topic features.replay.my-run.user-play-count-1h.v1 \
+  --group-id materialize-my-run-v1 \
+  --key-prefix featureforge-stream:replay:my-run:user_play_count_1h \
   --bounded
 ```
+
+Create and populate the feature topic before running this command.
+
+Use a new group and Redis prefix for an independent verification run. To resume
+an interrupted materialization, keep its original group, topic, and Redis prefix.
+
+The materializer captures the topic end offset at startup. It resumes from the
+group's committed offset when available, otherwise from the earliest available
+offset. It rejects an empty readable range. If the group's committed position
+already reaches the captured end offset of a non-empty range, it returns without
+processing additional records.
+
+Bounded mode does not implement a progress timeout. If polling stops yielding
+records before the captured boundary is reached, the process can keep waiting.
 
 ## Historical replay
 
@@ -452,7 +469,7 @@ FeatureForge Parquet events can be adapted and replayed into a dedicated Kafka t
 Preview without publishing:
 
 ```bash
-.venv/bin/python -m featureforge_stream.replay.featureforge_adapter \
+.venv/bin/python -m featureforge_stream.replay \
   --input path/to/events.parquet \
   --dataset-id my-dataset
 ```
@@ -460,7 +477,7 @@ Preview without publishing:
 Publish to a dedicated replay topic:
 
 ```bash
-.venv/bin/python -m featureforge_stream.replay.featureforge_adapter \
+.venv/bin/python -m featureforge_stream.replay \
   --input path/to/events.parquet \
   --dataset-id my-dataset \
   --send \
@@ -474,24 +491,70 @@ The adapter refuses to publish into the normal input topic. Historical replay mu
 interaction-events.replay.<run-name>.v1
 ```
 
+### Historical replay topic policy
+
+Create replay topics explicitly before publishing. Isolate input, validated,
+rejected, feature, and late-event topics, and configure each job to use them.
+
+For this local historical replay workflow, create all replay topics with:
+
+```text
+cleanup.policy=delete
+retention.ms=604800000
+message.timestamp.type=LogAppendTime
+```
+
+Example topic creation:
+
+```bash
+docker compose exec -T kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --create \
+  --topic features.replay.my-run.user-play-count-1h.v1 \
+  --partitions 1 \
+  --replication-factor 1 \
+  --config cleanup.policy=delete \
+  --config retention.ms=604800000 \
+  --config message.timestamp.type=LogAppendTime
+```
+
+`LogAppendTime` uses broker append time for the Kafka record timestamp. It does
+not rewrite JSON fields such as `event_time`, `ingested_at`, or
+`observation_time`. The current feature job assigns event time from the JSON
+`event_time` field, not from the Kafka record timestamp.
+
+Historical Kafka record timestamps combined with `CreateTime` and time-based
+retention can cause newly replayed output to be deleted as already expired.
+This occurred during local verification and was confirmed in broker logs.
+
+Check both earliest and latest offsets before consuming replay output. A large
+end offset alone does not prove that records remain readable. Changing a topic
+policy does not restore records already deleted.
+
+Run the bounded stages in order: publish input, finish validation, finish
+feature computation, then materialize. Each stage captures its input boundary
+when it starts.
+
+See [replay architecture](ARCHITECTURE.md#replay-mode) for execution limits.
+
 ## Project structure
 
 ```text
 featureforge-stream/
+├── jobs/
+│   ├── user_play_count_1h.py
+│   └── validate_and_route_events.py
 ├── src/
 │   └── featureforge_stream/
 │       ├── contracts/
 │       │   ├── events.py
 │       │   ├── feature_time.py
 │       │   └── routing.py
-│       ├── jobs/
-│       │   ├── user_play_count.py
-│       │   └── validate_events.py
 │       ├── reference/
 │       │   ├── admission.py
 │       │   └── user_play_count.py
-│       ├── replay/
-│       │   └── featureforge_adapter.py
+│       ├── replay.py
 │       ├── materialize.py
 │       └── online_store.py
 ├── tests/

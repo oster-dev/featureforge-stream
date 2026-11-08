@@ -618,6 +618,46 @@ The project focuses on skills required for a Data & Feature Infrastructure or ML
 - Operational boundaries
 - Production-oriented engineering judgment
 
+### Verify replay feature output against Redis
+
+After replay processing and Redis materialization have finished, compare the
+retained Kafka feature output with its isolated Redis namespace:
+
+```bash
+.venv/bin/python scripts/verify_kafka_redis.py \
+  --topic "<replay-feature-topic>" \
+  --key-prefix "<replay-redis-key-prefix>" \
+  --bootstrap-servers 127.0.0.1:9092 \
+  --redis-url redis://127.0.0.1:6379/0 \
+  --timeout-seconds 180
+```
+
+Replace both placeholders with the topic and Redis prefix from the same replay
+run. Stop writers to that topic and namespace before verification.
+
+The checker selects the latest observation window per user, then the highest
+play count within that window. It compares the complete feature values and
+reports missing values, differing values, and additional Redis namespace keys.
+
+The current implementation requires:
+- exactly one Kafka partition;
+- a non-empty retained range starting at offset zero;
+- contiguous record offsets and no tombstones;
+- unchanged Kafka watermarks during the Kafka read;
+- completed materialization and no concurrent writers.
+
+The checker reads feature data without writing Redis values or committing Kafka
+offsets. It scans the selected Redis database to identify additional namespace
+keys; this scan is not an atomic snapshot.
+
+A successful check prints a JSON report followed by:
+`PASS: latest Kafka feature values match Redis`.
+
+A mismatch or unsupported input causes a non-zero exit status. This verifies
+materialization consistency for a quiescent replay run; it does not establish
+batch-stream parity, replay completeness relative to the original source, or
+checkpoint recovery.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

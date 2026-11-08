@@ -658,6 +658,34 @@ materialization consistency for a quiescent replay run; it does not establish
 batch-stream parity, replay completeness relative to the original source, or
 checkpoint recovery.
 
+### Export and verify a replay snapshot
+
+After replay processing and Redis materialization have finished, export the
+retained feature windows and compare the latest persisted values with Redis:
+
+```bash
+.venv/bin/python scripts/export_replay_snapshot.py \
+  --topic "<replay-feature-topic>" \
+  --key-prefix "<replay-redis-key-prefix>" \
+  --output-dir "output/stream_snapshots/<unique-export-id>" \
+  --timeout-seconds 180
+```
+
+Replace all placeholders. Use the topic and Redis namespace from the same
+completed replay, stop writers, and choose an output directory that does not
+already exist.
+
+The export creates windows.parquet and verification.json. The report records
+Kafka offset boundaries, row counts, the Parquet SHA-256, and comparison results.
+A successful run prints:
+`PASS: persisted snapshot latest values match Redis`.
+
+This is a run-scoped streaming output artifact, not Project 1's canonical
+offline store or an independent batch-stream parity proof.
+
+See [Stream Snapshot V1](docs/contracts/user-play-count-1h-snapshot-v1.md)
+for schema, time semantics, prerequisites, and failure boundaries.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

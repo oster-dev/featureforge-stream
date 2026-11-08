@@ -27,3 +27,5 @@ dist/
 
 # macOS
 .DS_Store
+# Generated local streaming snapshot exports
+/output/stream_snapshots/

@@ -7,6 +7,7 @@ import pytest
 
 pytest.importorskip("confluent_kafka")
 
+
 from featureforge_stream import materialize as module
 from featureforge_stream.online_store import UserPlayCountFeatureV1
 

@@ -13,6 +13,7 @@ from featureforge_stream.contracts.events import InteractionEventV1
 
 FIXTURE_PATH = Path(__file__).resolve().parents[2] / "fixtures" / "user_play_count_1h_v1.jsonl"
 
+
 BOOTSTRAP_SERVERS = "kafka:29092"
 INPUT_TOPIC = "interaction-events.v1"
 VALIDATED_TOPIC = "interaction-events.validated.v1"

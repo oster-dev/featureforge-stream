@@ -14,9 +14,11 @@ from featureforge_stream.reference.user_play_count import count_user_plays_1h
 
 FIXTURE_PATH = Path(__file__).resolve().parents[2] / "fixtures" / "user_play_count_1h_v1.jsonl"
 
+
 BOOTSTRAP_SERVERS = "kafka:29092"
 INPUT_TOPIC = "interaction-events.v1"
 FEATURE_TOPIC = "features.user-play-count-1h.v1"
+
 
 FIXTURE_OBSERVATION_TIME = datetime(2026, 1, 1, 12, tzinfo=UTC)
 

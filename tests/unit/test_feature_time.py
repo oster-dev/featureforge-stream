@@ -12,6 +12,7 @@ from featureforge_stream.reference.user_play_count import count_user_plays_1h
 OBSERVATION_TIME = datetime(2026, 1, 1, 12, tzinfo=UTC)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
+
 OBSERVATION_MS = (OBSERVATION_TIME - EPOCH).days * 86_400_000 + (
     OBSERVATION_TIME - EPOCH
 ).seconds * 1000

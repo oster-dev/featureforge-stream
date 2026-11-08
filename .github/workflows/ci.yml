@@ -35,7 +35,7 @@ jobs:
         run: python -m venv .venv
 
       - name: Install package and development dependencies
-        run: .venv/bin/python -m pip install -e ".[dev]"
+        run: .venv/bin/python -m pip install -e ".[dev,replay]"
 
       - name: Check dependency compatibility
         run: .venv/bin/python -m pip check

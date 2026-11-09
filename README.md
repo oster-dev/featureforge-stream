@@ -686,6 +686,45 @@ offline store or an independent batch-stream parity proof.
 See [Stream Snapshot V1](docs/contracts/user-play-count-1h-snapshot-v1.md)
 for schema, time semantics, prerequisites, and failure boundaries.
 
+### Compare source events with a persisted snapshot
+
+Check counts and complete minute-aligned window coverage against independent
+Python event-time reconstruction:
+
+```bash
+.venv/bin/python scripts/verify_source_snapshot.py \
+  --input-topic "<validated-replay-topic>" \
+  --snapshot-dir "<existing-snapshot-directory>" \
+  --report "<new-report-path>.json"
+```
+
+A full-input mismatch is preserved even when observed late exclusions can
+explain it. To inspect that separate result:
+
+```bash
+.venv/bin/python scripts/reconcile_source_snapshot.py \
+  --input-topic "<validated-replay-topic>" \
+  --late-topic "<matching-feature-run-late-topic>" \
+  --snapshot-dir "<existing-snapshot-directory>" \
+  --report "<new-reconciliation-report-path>.json"
+```
+
+Replace all placeholders, use completed outputs from the same run, and choose
+new report paths. Store local reports under output/stream_snapshots/ to keep
+them outside Git.
+
+The observed replay contained 3,424 unique input events. All 200,399 existing
+snapshot counts matched, but full reconstruction expected 240 additional
+windows. Four payload-verified late events explained the difference.
+Reconstruction from the remaining 3,420 events matched both counts and complete
+window coverage.
+
+RECONCILED means consistency with observed exclusions, not independent proof
+of watermark decisions, Spark batch parity, or recovery.
+
+See [Source-to-Snapshot Verification V1](docs/contracts/source-snapshot-verification-v1.md)
+for contracts, evidence, and limitations.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

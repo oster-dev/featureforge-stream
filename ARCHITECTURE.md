@@ -1,16 +1,42 @@
 # Architecture — FeatureForge Stream
 
-FeatureForge Stream is a local, production-oriented streaming feature platform.
-It consumes validated interaction events from Kafka, computes an event-time
-feature with Apache Flink, publishes feature updates back to Kafka, and
-materializes the latest online feature value into Redis.
+FeatureForge Stream is a local, production-inspired streaming feature platform.
 
-The system is intentionally small, explicit, and testable. It demonstrates the
-core responsibilities of a feature platform: contracts, event-time semantics,
-stream processing, late data, deduplication, online materialization, and
-verifiable correctness.
+It consumes interaction events from Kafka, validates their contracts, computes
+event-time features with Apache Flink, publishes feature updates back to Kafka,
+and materializes online feature values into Redis.
 
-## System overview
+The current feature implementations are:
+
+- `user_play_count_1h`
+- `user_skip_rate_24h`
+
+The system is deliberately small, explicit, and testable. Its purpose is to
+demonstrate trustworthy feature computation under duplicate delivery, late
+arrivals, replay, and selected failure scenarios—not production scale or
+blanket exactly-once guarantees.
+
+## 1. Implementation and evidence status
+
+Different components have different proof boundaries.
+
+| Capability | Current evidence | Boundary |
+|---|---|---|
+| Event validation | Contract tests and Flink validation integration tests | Explicitly supported event contract |
+| User play count | Python reference and Flink integration tests | Declared one-hour event-time semantics |
+| User skip rate | Python reference and eight isolated Flink integration cases | Declared 24-hour windows, late corrections, duplicates, zero denominator, and late routing |
+| Play-count online materialization | Kafka-to-Redis verification and Redis tests | Single-partition output and guarded append-only counts |
+| Skip-rate online store | Payload/policy tests and twelve real Redis integration cases | Componentwise count ordering within a consistent run namespace |
+| Skip-rate materialization | Materializer unit tests and a real Kafka-to-Redis integration test | Controlled feature payloads published directly to Kafka |
+| Play-count historical snapshots | Versioned Parquet export and snapshot-to-online verification | Bounded, run-scoped artifact |
+| Source-to-snapshot verification | Independent source comparison, coverage checks, and late-output reconciliation | Declared play-count snapshot scope |
+| TaskManager recovery | Documented manual play-count recovery drill | Specific local failure scenario |
+| Combined skip-rate pipeline | Flink and materialization paths tested separately | No single joined events-to-Flink-to-Redis proof claimed yet |
+
+The presence of a component does not imply that every possible combination
+of components has been tested together.
+
+## 2. System overview
 
 ```text
 FeatureForge Parquet source
@@ -19,75 +45,110 @@ FeatureForge Parquet source
    Replay adapter (optional)
             |
             v
-interaction-events.v1
+Raw interaction-event Kafka topic
             |
             v
-+---------------------------+
-| Validation job            |
-| Kafka -> Flink -> Kafka   |
-+---------------------------+
-      |                  |
-      v                  v
-validated events    rejected events
++--------------------------------+
+| Validation job                 |
+| Kafka -> Flink -> Kafka        |
++--------------------------------+
+      |                      |
+      v                      v
+Validated events       Rejected events
+      |
+      +-------------------------------+
+      |                               |
+      v                               v
++-------------------------+  +-------------------------+
+| user_play_count_1h job  |  | user_skip_rate_24h job  |
+| Kafka -> Flink -> Kafka |  | Kafka -> Flink -> Kafka |
++-------------------------+  +-------------------------+
+      |            |              |             |
+      v            v              v             v
+Play-count     Play-count     Skip-rate      Skip-rate
+updates        late events    updates        late events
+      |                           |
+      v                           v
++-------------------------+  +-------------------------+
+| Play-count materializer |  | Skip-rate materializer  |
+| Kafka -> Redis          |  | Kafka -> Redis          |
++-------------------------+  +-------------------------+
+      |                           |
+      v                           v
+Latest play-count value      Latest skip-rate value
+per user                     per user
+
+Play-count Kafka output
       |
       v
-+---------------------------+
-| Feature job               |
-| Kafka -> Flink -> Kafka   |
-+---------------------------+
-      |                  |
-      v                  v
-feature updates       too-late events
+Bounded snapshot exporter
       |
-      v
-+---------------------------+
-| Redis materializer        |
-| Kafka -> Redis            |
-+---------------------------+
+      +--> windows.parquet
       |
-      v
-Online feature lookup
+      +--> verification.json
+                  |
+                  v
+       Snapshot-to-online comparison
+
+Source events + play-count snapshot + recorded late output
+                  |
+                  v
+       Source verification and reconciliation
 ```
 
-## Core design principles
+The two feature jobs are separate applications. Their defaults use the same
+validated input topic, but each job has its own feature output, late output,
+consumer group, and operator identifiers.
 
-- **Event time is authoritative.** Feature windows are defined by `event_time`, not by Kafka arrival time or ingestion time.
-- **Contracts come first.** Invalid input is rejected explicitly rather than silently coerced or dropped.
-- **Correctness is observable.** A deterministic Python reference defines the expected feature semantics and is compared against the streaming implementation.
-- **Late data is handled explicitly.** Events may correct an already emitted window, but events beyond the retention boundary are routed to a dedicated late topic.
-- **Duplicates are suppressed by logical identity.** Repeated Kafka deliveries do not inflate a feature value.
-- **Online writes are guarded.** Redis materialization prevents stale or regressive updates from overwriting newer feature state.
-- **The system remains deliberately simple.** Kafka, Flink, and Redis are used directly; no additional orchestration or feature-store framework is introduced.
+Tests and historical runs can override topic names to isolate state and
+watermark progression.
 
-## Runtime components
+## 3. Core design principles
+
+- Event time defines feature-window membership.
+- Contracts are validated explicitly.
+- Logical identity and receipt metadata are separate concepts.
+- Reference correctness and distributed execution are tested separately.
+- Late corrections are part of normal feature computation.
+- Duplicate suppression has a finite, documented retention horizon.
+- Online update rules are feature-specific.
+- Independent runs must not silently share incompatible state.
+- Every claim is bounded by its actual test or recorded drill.
+- Existing FeatureForge Batch artifacts remain owned by Project 1.
+
+## 4. Runtime components
 
 | Component | Responsibility |
 |---|---|
-| Kafka | Durable event transport and decoupling between producers, processing, and materialization |
-| Validation job | Validates raw interaction events and routes valid and rejected records to separate topics |
-| Feature job | Deduplicates events, assigns event time, computes sliding one-hour play counts, and emits feature updates |
-| Redis materializer | Consumes feature updates and writes guarded online feature values to Redis |
-| Redis | Stores the latest online feature value per user |
-| Replay adapter | Converts selected FeatureForge Parquet records into Kafka-compatible interaction events |
+| Kafka | Event transport, retained input/output, and stage decoupling |
+| Validation job | Validates raw events and separates valid records from rejections |
+| Play-count job | Computes one-hour user play counts |
+| Skip-rate job | Computes 24-hour user play and skip counts and their ratio |
+| Play-count materializer | Applies guarded play-count updates to Redis |
+| Skip-rate materializer | Applies guarded skip-rate count-vector updates to Redis |
+| Redis | Stores the latest accepted observation window per user and feature namespace |
+| Replay adapter | Reads supported Project 1 Parquet events and publishes adapted records |
+| Snapshot exporter | Creates a bounded play-count Parquet artifact and verification report |
+| Source verifier and reconciler | Compare declared source-derived expectations with snapshots and recorded late output |
 
-## Data flow
+## 5. Source integration and project ownership
 
-### 1. Source events
+FeatureForge Stream extends FeatureForge Batch through explicit contracts.
+It does not rebuild or modify Project 1's canonical offline store.
 
-FeatureForge produces interaction events containing an event identity, user and
-content identifiers, event type, event time, ingestion time, source, and schema
-version.
+The replay adapter reads supported Parquet source records and maps them to
+`InteractionEventV1`.
 
-The streaming platform does not modify the source platform. Instead, an explicit
-adapter reads supported Parquet records, maps source fields to the streaming
-contract, and publishes them to a dedicated replay topic.
-
-Supported source event types are:
+Currently supported source event types are:
 
 - `play`
 - `impression`
 
-Source device types are mapped as follows:
+The streaming event contract also supports `skip` and `complete`.
+Support in the stream contract does not mean the existing Project 1 adapter
+produces every event type.
+
+Source device mapping:
 
 | Source device type | Stream source |
 |---|---|
@@ -97,39 +158,57 @@ Source device types are mapped as follows:
 | `mobile` | `mobile` |
 | `tv` | `tv` |
 
-The adapter preserves source event times and ingestion times. It does not
-simulate real-time arrival with wall-clock delays.
+The adapter preserves source event and ingestion timestamps. It does not
+simulate real-time arrival through wall-clock delays.
 
-### 2. Validation
+Historical publication requires a dedicated topic beginning with:
 
-Raw events enter `interaction-events.v1`.
+```text
+interaction-events.replay.
+```
 
-The validation job parses each record against `InteractionEventV1`:
+The adapter refuses to publish historical records directly to the normal
+live input topic.
 
-- `event_id` must be a UUID.
-- `event_time` and `ingested_at` must be timezone-aware ISO-8601 timestamps.
+## 6. Event contract and validation
+
+Default raw input:
+
+```text
+interaction-events.v1
+```
+
+The validation job parses records as `InteractionEventV1`.
+
+Rules include:
+
+- `event_id` is a UUID.
+- `event_time` and `ingested_at` are timezone-aware timestamps.
+- Timestamp strings contain an ISO-8601 datetime with a `T` separator.
 - Timestamps are normalized to UTC.
-- `ingested_at` must be on or after `event_time`.
-- `user_id` and `content_id` must be non-empty and contain no whitespace.
-- `event_type` must be one of `impression`, `play`, `skip`, or `complete`.
-- `source` must be one of `web`, `mobile`, or `tv`.
-- `play_seconds` must be a non-negative integer.
+- `ingested_at >= event_time`.
+- Entity IDs are non-empty strings without whitespace.
+- `event_type` is `impression`, `play`, `skip`, or `complete`.
+- `source` is `web`, `mobile`, or `tv`.
+- `play_seconds` is a strict non-negative integer.
+- `schema_version` is `v1`.
 - Unknown fields are rejected.
-- `impression` events must have `play_seconds = 0`.
+- Impression events have `play_seconds = 0`.
 
-Valid records are published to:
+Default valid output:
 
 ```text
 interaction-events.validated.v1
 ```
 
-Invalid records are published to:
+Default rejected output:
 
 ```text
 interaction-events.rejected.v1
 ```
 
-A rejected record contains:
+Rejected records preserve the original payload and structured validation
+information:
 
 ```json
 {
@@ -140,339 +219,458 @@ A rejected record contains:
 }
 ```
 
-Reason codes:
-
 | Reason code | Meaning |
 |---|---|
-| `INVALID_JSON` | The payload is not valid JSON |
-| `EVENT_CONTRACT_VIOLATION` | The JSON is valid but violates the event contract |
+| `INVALID_JSON` | Payload cannot be parsed as valid JSON |
+| `EVENT_CONTRACT_VIOLATION` | JSON violates the declared event contract |
 
-Validation failures are isolated per record. One invalid event does not prevent
-subsequent valid events from being processed.
+Validation failures are isolated per record.
 
-## Event identity
+A feature job also parses its input against `InteractionEventV1`, but this is
+not a replacement for the validation job's structured rejection routing.
+Feature jobs normally consume validated input.
 
-An event is identified by `event_id`.
+## 7. Logical event identity
 
-Two deliveries with the same `event_id` are treated as the same logical event
-only when their logical payload is identical. The `ingested_at` field is
-excluded from logical identity because it describes delivery or receipt time,
-not the business meaning of the interaction.
+Logical identity is `event_id`.
 
-The logical payload includes:
+Two deliveries with the same ID represent the same logical event only when
+their logical payloads match.
 
-- `event_id`
-- `event_time`
-- `user_id`
-- `content_id`
-- `event_type`
-- `play_seconds`
-- `source`
-- `schema_version`
+Logical payload includes:
 
-If the same `event_id` arrives with a different logical payload, the system
-raises an `EventIdentityConflictError`. This prevents silently accepting
-contradictory data under one identity.
+- Event identity
+- Event time
+- User and content IDs
+- Event type
+- Playback duration
+- Source
+- Schema version
 
-## Event-time semantics
+`ingested_at` is excluded because it represents receipt metadata.
 
-The feature is computed in event time.
+Conflicting payloads for one ID raise `EventIdentityConflictError`.
 
-For `user_play_count_1h`, the feature window is:
+The Python references validate identities over the complete supplied input
+before applying user, event-type, or time filters.
+
+Streaming jobs can detect conflicts only while the relevant deduplication
+state is retained. An identity conflict is a job error, not a normal
+validation-rejection record.
+
+## 8. Time semantics
+
+### Event time versus availability
+
+Window membership uses `event_time`.
+
+`ingested_at` remains separate receipt metadata. The Python references can
+include an event whose receipt timestamp is later than the observation time.
+
+These references reconstruct event-time values from supplied records.
+They do not establish what an online consumer could have known at a
+historical observation time.
+
+### Right-closed windows
+
+Both features use:
 
 ```text
-(observation_time - 1 hour, observation_time]
+(observation_time - window_length, observation_time]
 ```
 
-This is a right-closed interval:
+The lower boundary is excluded; the upper boundary is included.
 
-- An event exactly at `observation_time` belongs to the window.
-- An event exactly at `observation_time - 1 hour` does not belong to the window.
-- An event after `observation_time` does not belong to the window.
-
-Flink windows are left-closed and right-open:
+Flink's native windows use:
 
 ```text
 [start, end)
 ```
 
-To preserve the reference semantics, event timestamps are mapped before window
-assignment:
+The timestamp assignment maps original event times as follows:
 
 ```python
 mapped_timestamp_ms = ceil(event_time_in_microseconds / 1000) - 1
 ```
 
-This mapping preserves the intended right-closed feature boundary while using
-Flink’s native half-open window model.
+For whole-millisecond window boundaries, this preserves the declared
+right-closed membership.
 
-## Feature definition
+The mapped value is a window-assignment timestamp, not a replacement for
+the original payload timestamp.
 
-### `user_play_count_1h`
+## 9. Feature definitions
 
-`user_play_count_1h` counts the number of unique `play` events for one user
-within the preceding hour.
+### user_play_count_1h
 
-```text
-user_play_count_1h(user, observation_time)
-= count of unique play events
-  where event_time > observation_time - 1 hour
-    and event_time <= observation_time
-```
-
-Example:
+Count unique `play` events for one user within:
 
 ```text
-Observation time: 12:00:00Z
-Window:           11:00:00Z < event_time <= 12:00:00Z
+(observation_time - 1 hour, observation_time]
 ```
 
-Only `play` events contribute to the count.
+Other valid event types do not increment the count.
 
-`impression`, `skip`, and `complete` events are valid contract events but do not
-increase the feature value.
+The Python reference returns an integer. Empty eligible input returns zero.
 
-## Windowing
+### user_skip_rate_24h
 
-The feature job uses one-hour sliding event-time windows with a one-minute
-slide.
+For one user within:
 
 ```text
-Window length: 1 hour
-Slide interval: 1 minute
+(observation_time - 24 hours, observation_time]
 ```
 
-This produces a feature update at every whole minute for each user with at
-least one qualifying event in the current window.
-
-For example, at `12:00:00Z`, the job computes:
+compute:
 
 ```text
-11:00:00Z < event_time <= 12:00:00Z
+skip_rate = skip_count / (play_count + skip_count)
 ```
 
-At `12:01:00Z`, it computes:
+Rules:
+
+- Counts use unique logical events.
+- A zero denominator produces `0.0`.
+- Impression and complete events contribute to neither count.
+- Output rate is a float in `[0.0, 1.0]`, not a percentage.
+- Content IDs do not partition this user-level feature.
+- No pairing between plays and skips is inferred.
+
+This is a ratio of event counts, not a session-level skip probability.
+
+The output retains both counts so that consumers can validate the rate and
+apply the declared update policy.
+
+## 10. Window execution
+
+| Feature | Window length | Slide |
+|---|---|---|
+| `user_play_count_1h` | 1 hour | 1 minute |
+| `user_skip_rate_24h` | 24 hours | 1 minute |
+
+Observation times are minute-aligned.
+
+Windows emit when event-time progress permits, not simply because wall-clock
+time reaches the next minute. Allowed-late events can cause further emissions
+for an already emitted window.
+
+All accepted event types enter window aggregation. A window containing only
+non-contributing event types can therefore emit a zero result.
+
+The jobs do not create windows for users with no input events. They do not
+provide an indefinite wall-clock heartbeat after input stops.
+
+### Local state-cost boundary
+
+With a one-minute slide:
+
+- A one-hour window assigns an event to 60 windows.
+- A 24-hour window assigns an event to 1,440 windows.
+
+The skip-rate configuration prioritizes a small, understandable correctness
+demonstration. It is not a throughput benchmark or a demonstrated
+production-scale state design.
+
+Aggregators retain counts rather than full event lists per window.
+Deduplication state is maintained separately.
+
+## 11. Watermarks and late-event admission
+
+Both feature jobs configure:
 
 ```text
-11:01:00Z < event_time <= 12:01:00Z
+Bounded out-of-orderness: 10 minutes
+Allowed lateness:        30 minutes
 ```
 
-## Watermarks and late data
+Watermarks describe event-time progress. They are affected by observed
+timestamps, source/channel progress, and runtime watermark emission.
 
-The feature job uses a bounded out-of-orderness watermark strategy:
+Allowed lateness applies to individual assigned windows. An event may be
+too late for an earlier assigned window while still being accepted by
+another overlapping window.
 
-```text
-Watermark delay: 10 minutes
-Allowed lateness: 30 minutes
-```
+An event is routed to the feature's late side output when all its assigned
+windows are too late.
 
-An event is classified relative to the maximum event time observed before it:
+A single event-age classification relative to a maximum timestamp is not
+an exact simulation of this sliding-window behavior.
 
-| Condition | Classification |
-|---|---|
-| `event_time >= max_event_time_seen - watermark_delay` | `ON_TIME` |
-| `event_time >= max_event_time_seen - watermark_delay - allowed_lateness` | `ALLOWED_LATE` |
-| Otherwise | `TOO_LATE` |
+### Admission reference boundary
 
-The first observed event is always classified as `ON_TIME`.
+`reference/admission.py` provides a simplified arrival-order policy used by
+verification and reconciliation.
 
-A too-late event does not advance the maximum observed event time. This prevents
-an old event from permanently suppressing the watermark for subsequent events.
+It must not be described as the exact live Flink watermark scheduler or as
+a complete model of per-window admission.
+
+Accelerated replay preserves source timestamps, but runtime watermark
+scheduling can affect which late records are admitted. Arrival order alone
+does not prove identical admission across executions.
 
 ### Late corrections
 
-An allowed-late event can still update a window that has already emitted a
-feature value.
+Play counts can increase when an additional play is accepted for an
+already emitted window.
+
+Skip rates can move in either direction:
+
+| Accepted same-window state | Plays | Skips | Rate |
+|---|---:|---:|---:|
+| Initial | 1 | 1 | 0.5 |
+| Additional play | 2 | 1 | 1/3 |
+| Additional skip | 2 | 2 | 0.5 |
+
+A lower rate is not necessarily a stale update.
+
+### Late outputs
+
+| Feature | Default late topic |
+|---|---|
+| Play count | `interaction-events.user-play-count-1h.late.v1` |
+| Skip rate | `interaction-events.user-skip-rate-24h.late.v1` |
 
 Example:
-
-1. A play event arrives for the `11:00–12:00` window.
-2. The job emits `user_play_count_1h = 1`.
-3. Another valid play event for the same window arrives later.
-4. The job emits an updated feature value of `2`.
-
-This is intentional event-time correction, not an error.
-
-### Too-late routing
-
-Once all windows assigned to an event have expired, including their allowed
-lateness period, the event can no longer change a feature value.
-
-Such events are written to:
-
-```text
-interaction-events.user-play-count-1h.late.v1
-```
-
-The late-event record contains:
 
 ```json
 {
   "error_schema_version": "v1",
   "reason_code": "TOO_LATE_FOR_ALL_ASSIGNED_WINDOWS",
-  "feature_name": "user_play_count_1h",
+  "feature_name": "user_skip_rate_24h",
   "raw_payload": "<original event payload>"
 }
 ```
 
-This makes data-loss behavior explicit instead of silently dropping old events.
+## 12. Deduplication and state retention
 
-## Deduplication
+Both jobs key deduplication state by `event_id`.
 
-The feature job deduplicates events by `event_id`.
+| Job | Deduplication TTL |
+|---|---|
+| Play count | 24 hours |
+| Skip rate | 48 hours |
 
-Deduplication state uses a 24-hour time-to-live:
+TTL uses processing time, not event time.
 
-```text
-DEDUPE_TTL_HOURS = 24
-```
+The first accepted delivery stores the logical payload. Identical repeated
+deliveries are suppressed and do not extend retention.
 
-A repeated delivery with the same logical payload is ignored. It does not:
+After TTL expiry, the same ID may be accepted again. This can occur even
+while an event-time window remains open if watermark progress has stalled.
 
-- Increase the feature count.
-- Extend the deduplication retention period.
-- Produce another feature update.
+The TTL is therefore a finite duplicate/conflict-detection horizon, not a
+proof of unlimited replay safety.
 
-This protects the feature against at-least-once Kafka delivery semantics.
+Each job has independent state. Running both features does not create a
+shared global deduplication service.
 
-## Feature output contract
+## 13. Feature output contracts
 
-Feature updates are published to:
+### Play-count output
+
+Default topic:
 
 ```text
 features.user-play-count-1h.v1
 ```
-
-Each record has this structure:
 
 ```json
 {
   "feature_schema_version": "v1",
   "feature_name": "user_play_count_1h",
   "user_id": "user_000001",
-  "observation_time": "2026-01-01T12:00:00Z",
-  "window_start_exclusive": "2026-01-01T11:00:00Z",
+  "observation_time": "2026-01-02T12:00:00Z",
+  "window_start_exclusive": "2026-01-02T11:00:00Z",
   "play_count": 3
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `feature_schema_version` | Version of the feature output contract |
-| `feature_name` | Stable feature identifier |
-| `user_id` | Feature entity |
-| `observation_time` | Right-closed end of the feature window |
-| `window_start_exclusive` | Exclusive start of the one-hour feature window |
-| `play_count` | Number of unique play events in the window |
+### Skip-rate output
 
-## Online materialization
+Default topic:
 
-The Redis materializer consumes feature updates from Kafka and writes the
-latest feature state to Redis.
+```text
+features.user-skip-rate-24h.v1
+```
 
-The Redis key format is:
+```json
+{
+  "feature_schema_version": "v1",
+  "feature_name": "user_skip_rate_24h",
+  "user_id": "user_000001",
+  "observation_time": "2026-01-02T12:00:00Z",
+  "window_start_exclusive": "2026-01-01T12:00:00Z",
+  "play_count": 3,
+  "skip_count": 2,
+  "skip_rate": 0.4
+}
+```
+
+The skip-rate payload model validates:
+
+- Strict non-negative integer counts
+- A finite rate within `[0.0, 1.0]`
+- Rate consistency with counts, within the declared numerical tolerance
+- Exactly 24 hours between window boundaries
+- Timezone-aware timestamps normalized to UTC
+- Feature name and schema version
+- Entity-ID syntax
+- Rejection of unknown fields
+
+Both jobs use at-least-once Kafka sinks. Duplicate output records are possible.
+
+## 14. Online materialization
+
+Redis stores the latest accepted observation window per user in a
+feature-specific namespace.
+
+These are latest-value stores, not historical window stores.
+
+### Play-count policy
+
+Default key format:
 
 ```text
 featureforge-stream:online:v1:user_play_count_1h:<user_id>
 ```
 
-Example:
+Stored model: `UserPlayCountFeatureV1`.
+
+| Incoming value | Decision |
+|---|---|
+| Newer observation window | `written` |
+| Older observation window | `stale` |
+| Same window, larger count | `written` |
+| Same window, equal count | `unchanged` |
+| Same window, smaller count | `stale` |
+
+This policy is specific to append-only counts without retractions.
+It cannot repair an already inflated count.
+
+### Skip-rate policy
+
+Stored model: `UserSkipRateFeatureV1`.
+
+The skip-rate materializer requires an explicit `--key-prefix`.
+Independent runs require independent namespaces.
+
+Within the same window, compare:
 
 ```text
-featureforge-stream:online:v1:user_play_count_1h:user_000001
+(play_count, skip_count)
 ```
 
-The stored value is the serialized `UserPlayCountFeatureV1` record.
+| Incoming value | Decision |
+|---|---|
+| Newer observation window | `written` |
+| Older observation window | `stale` |
+| Same window, identical counts | `unchanged` |
+| Both counts greater than or equal, at least one greater | `written` |
+| Both counts less than or equal, at least one smaller | `stale` |
+| One count increases and the other decreases | Raise `SkipRateUpdateConflictError` |
 
-### Write policy
+The policy does not compare rates by magnitude.
 
-The materializer applies an append-only, guarded write policy.
+It does not merge conflicting records by taking componentwise maxima,
+because that could manufacture a result the job never emitted.
 
-| Incoming feature | Stored feature | Result |
-|---|---|---|
-| Older observation time | Any | `stale` |
-| Same observation time, lower count | Any | `stale` |
-| Same observation time, equal count | Any | `unchanged` |
-| Same observation time, higher count | Any | `written` |
-| Newer observation time | Any | `written` |
+Componentwise ordering assumes consistent append-only computation within
+one run namespace. It does not prove that two independent computations used
+the same event set.
 
-This policy supports:
-
-- Newer windows replacing older windows.
-- Late corrections increasing a count within the same window.
-- Repeated deliveries remaining idempotent.
-- Replayed older values being rejected.
-
-It does not support retractions or arbitrary feature revisions. A count for the
-same window can only increase; an already inflated value cannot be repaired by
-this policy.
+Retracted events, downward count corrections, and repair of inflated counts
+are unsupported.
 
 ### Concurrency control
 
-Redis writes use optimistic concurrency control:
+Both stores use Redis optimistic concurrency:
 
-1. Watch the feature key.
-2. Read the currently stored feature.
-3. Apply the write policy.
-4. Start a Redis transaction.
-5. Write the new feature payload.
-6. Execute the transaction.
+1. Watch the user key.
+2. Read and validate its current payload.
+3. Apply the feature-specific policy.
+4. For an accepted write, execute `MULTI/SET/EXEC`.
+5. Retry after `WatchError`, reading the current value again.
 
-If another writer changes the key between the read and the transaction, Redis
-raises `WatchError`. The materializer retries up to 16 times.
+Retries are bounded at 16 attempts. Connection errors, invalid stored payloads,
+policy conflicts, and exhausted retries propagate to the caller.
 
-This prevents a stale writer from overwriting a newer concurrent update.
+A real Redis test exercises a competing same-window skip-rate write and
+verifies that the retry preserves the more advanced count vector.
 
-## Replay mode
+## 15. Materializer offsets and failure boundaries
 
-The system supports continuous processing and bounded historical replay.
+Materializers currently support exactly one Kafka partition.
 
-| Mode | Purpose |
-|---|---|
-| Continuous streaming | Process arriving records without a fixed input end |
-| Bounded replay | Process a finite input range captured when the stage starts |
+They inspect the retained low/high offsets and start from the group's
+committed offset when available, otherwise from the retained low offset.
+A start offset below the retained low offset is advanced to that low offset.
 
-### Stage ordering
+In bounded mode, the captured high offset is the exclusive stopping boundary.
 
-Both Flink jobs support `--bounded`. Their Kafka sources start at the earliest
-available offsets and capture stopping offsets when the source initializes.
+Behavior:
 
-For an isolated historical run:
+- An empty readable range is rejected.
+- An already caught-up group returns without writes.
+- Tombstones and invalid feature payloads are rejected.
+- Redis processing precedes offset commit.
+- Successful no-op outcomes are processed records and can be committed.
+- Commits use the next offset and are synchronous.
+- A failed record is not committed as successfully processed.
 
-1. Create dedicated replay topics with the timestamp policy below.
-2. Publish the complete adapted source dataset.
+A Redis write and a Kafka offset commit are not one distributed transaction.
+A failure between them can cause redelivery.
+
+The skip-rate materializer disables both automatic commits and automatic
+offset storage.
+
+There is no overall or idle-progress timeout. Bounded mode defines an
+offset boundary, not a wall-clock completion guarantee.
+
+### Proof boundaries
+
+Play-count Kafka-to-Redis consistency has a separate verification path.
+
+Skip-rate Kafka-to-Redis integration checks:
+
+- Decreasing and increasing rates
+- Stored Redis values after each phase
+- Stale and unchanged updates
+- Newer zero-valued windows
+- Committed offsets read through a separate consumer
+- Caught-up execution without writes
+- Replay of the same output with a fresh consumer group
+
+The skip-rate integration publishes controlled feature payloads directly
+to Kafka. A combined interaction-events-to-Flink-to-Redis execution is not
+claimed by that test.
+
+## 16. Historical replay
+
+The validation job and both feature jobs support `--bounded`.
+
+Sources start at the earliest available offsets and capture stopping offsets
+during source initialization.
+
+For an isolated staged replay:
+
+1. Create dedicated topics.
+2. Publish the complete adapted dataset.
 3. Run validation and wait for `FINISHED`.
-4. Verify validated and rejected output ranges.
-5. Run feature computation and wait for `FINISHED`.
-6. Verify feature and late-event output ranges.
-7. Materialize feature output into an isolated Redis prefix.
-8. Compare expected latest Kafka feature values with Redis.
+4. Verify validated/rejected output.
+5. Run the selected feature job and wait for `FINISHED`.
+6. Verify feature and late output.
+7. Materialize into an isolated Redis namespace.
+8. Run the applicable consistency checks.
 
-Starting a bounded downstream stage before its upstream output is complete can
-capture an incomplete range.
+Starting a bounded downstream stage too early can capture an incomplete
+upstream range.
 
-### Materializer boundary and commits
-
-The Redis materializer supports one partition. It captures the partition end
-offset at startup and starts from the group's committed offset, when available,
-or the earliest available offset otherwise.
-
-It rejects a topic with no readable records. For a non-empty range already
-consumed by the group, bounded mode returns without processing additional
-records.
-
-Kafka offsets are committed after successful Redis processing, including
-guarded no-op outcomes (`unchanged` or `stale`). A failure after a Redis write
-but before an offset commit can cause that update to be delivered again.
-
-The current implementation has no overall or idle-progress timeout. Bounded
-mode defines an offset boundary, not a guaranteed wall-clock completion time.
-If records stop arriving before that boundary is reached, polling can continue
-indefinitely.
+Fresh topics and namespaces do not by themselves establish deterministic
+late-event admission; watermark scheduling remains relevant.
 
 ### Kafka timestamps and retention
 
-For local historical replay topics, use:
+The declared local historical replay-topic policy is:
 
 ```text
 cleanup.policy=delete
@@ -480,197 +678,408 @@ retention.ms=604800000
 message.timestamp.type=LogAppendTime
 ```
 
-Apply this policy when creating replay topics, including feature and late-event
-outputs. The seven-day retention is a local demonstration policy, not a
-universal production recommendation.
+This policy applies to explicitly configured historical replay topics.
+It is not a claim that every integration-test topic uses these settings.
 
-Kafka's record timestamp is transport metadata. With `LogAppendTime`, it is
-set from broker append time. JSON timestamps retain their original meanings:
+Kafka record timestamps are transport metadata. JSON event, receipt, and
+observation timestamps retain their separate meanings.
 
-- `event_time`: interaction occurrence time.
-- `ingested_at`: original platform input receipt time.
-- `observation_time`: feature window observation time.
+Feature jobs extract event time from payloads. `LogAppendTime` therefore
+does not change declared feature-window membership.
 
-The current Flink feature job explicitly extracts event time from the payload.
-Changing the Kafka record timestamp policy therefore does not change its
-declared feature-window membership.
+A previous local replay demonstrated historical output deletion under
+time-based retention with `CreateTime`. Broker logs confirmed the deletion.
 
-A local replay using `CreateTime` produced historical output timestamps.
-Broker logs confirmed that time-based retention deleted the feature and
-late-event output before materialization. The validated source remained
-readable, so only feature computation needed to be repeated into new output
-topics.
+Inspect low and high offsets together:
 
-Check earliest and latest offsets together. Equal offsets indicate an empty
-readable range; an end offset alone is not a retained-record count. Already
-deleted records cannot be recovered by changing retention settings.
+- Equal offsets mean no readable range.
+- A high offset alone is not a retained-record count.
+- Changing retention cannot restore deleted records.
 
-### Verification boundaries
+## 17. Play-count snapshots
 
-Comparing latest Kafka feature values with Redis proves materialization
-consistency for the checked run. It does not establish batch-stream parity,
-checkpoint recovery, or end-to-end exactly-once delivery.
+Snapshot support currently applies to `user_play_count_1h`.
 
-Accelerated replay retains source timestamps and arrival order. Watermark
-scheduling can affect late-event admission. Replay ordering alone does not
-establish deterministic admission across executions.
-
-## Kafka topology
-
-| Topic | Purpose |
-|---|---|
-| `interaction-events.v1` | Raw input events |
-| `interaction-events.validated.v1` | Contract-valid events |
-| `interaction-events.rejected.v1` | Invalid or contract-violating events |
-| `features.user-play-count-1h.v1` | Feature updates |
-| `interaction-events.user-play-count-1h.late.v1` | Events too late for all assigned windows |
-| `interaction-events.replay.<run-name>.v1` | Dedicated replay input topic |
-
-The replay adapter requires a dedicated replay topic beginning with:
+A completed export contains:
 
 ```text
-interaction-events.replay.
+windows.parquet
+verification.json
 ```
 
-It refuses to publish historical records directly to the normal input topic.
-This protects the live validation pipeline from accidental historical replays.
+Contract identifiers:
 
-## Local infrastructure
+```text
+featureforge-stream.user-play-count-1h.snapshot.v1
+featureforge-stream.replay-snapshot-export.v1
+```
+
+The snapshot is not Project 1's canonical offline store and is not
+schema-compatible with its existing engagement feature tables.
+
+No automatic Feast or Project 3 compatibility is claimed.
+
+### Row semantics
+
+Rows contain the declared play-count feature fields.
+
+Logical key:
+
+```text
+(user_id, observation_time)
+```
+
+Rows are sorted by that key. Repeated same-window updates are consolidated
+using maximum `play_count`.
+
+This is valid only for the declared append-only count model.
+It cannot represent downward revisions or repair inflated counts.
+
+Different observation windows remain separate rows.
+
+This consolidation policy must not be reused as maximum `skip_rate`.
+Skip-rate snapshot support is not implemented by this exporter.
+
+### Export prerequisites
+
+The declared export requires:
+
+- Completed upstream replay and materialization
+- A quiescent Kafka output and Redis namespace
+- One Kafka partition
+- A non-empty retained range beginning at offset zero
+- Contiguous offsets and no tombstones
+- Stable Kafka low/high offsets during reading
+- A new output directory
+
+The exporter records offsets, row counts, contract metadata, and a Parquet
+SHA-256. It reads back and validates the persisted artifact before comparison.
+
+The latest persisted window per user is compared with Redis, including a
+check for additional namespace keys.
+
+Redis reads and namespace scanning are not an atomic database snapshot.
+
+### Acceptance and publication
+
+An accepted export requires a valid `verification.json`, matching Parquet
+hash, and `comparison.passed = true`.
+
+The Parquet file and report are not published as one crash-atomic unit.
+Interrupted or failed exports can leave incomplete directories.
+
+The exporter holds bounded replay data in memory. It is not a continuous
+offline sink or a demonstrated large-scale writer.
+
+Snapshot-to-online consistency does not establish historical training
+availability or leakage-safe retrieval.
+
+Detailed contract:
+
+```text
+docs/contracts/user-play-count-1h-snapshot-v1.md
+```
+
+## 18. Source verification and late reconciliation
+
+Source-to-snapshot checks provide an additional proof beyond comparing
+Redis with Kafka-derived output.
+
+The verification path compares source-derived play-count expectations with
+the declared snapshot windows, checks coverage, and reports differences.
+
+Recorded late output can then be used to reconcile observed exclusions under
+the declared verification policy.
+
+The completed local evidence includes source-to-snapshot coverage and
+separate reconciliation using verified late events.
+
+This is not a Spark-versus-Flink parity suite. It does not prove arbitrary
+batch-stream equivalence, complete historical training safety, or exact
+simulation of Flink's runtime admission behavior.
+
+Detailed contract:
+
+```text
+docs/contracts/source-snapshot-verification-v1.md
+```
+
+## 19. Checkpoints and recovery evidence
+
+Both feature jobs enable checkpointing at a 10-second interval.
+
+Checkpoint configuration alone does not prove successful recovery or
+end-to-end exactly-once processing.
+
+### Completed manual play-count drill
+
+A controlled local drill:
+
+1. Kept the JobManager and Kafka running.
+2. Killed and restarted the TaskManager.
+3. Observed the same job restore from checkpoint `23`.
+4. Repeated an original play and added a new play.
+5. Observed the reference count `2`.
+6. Observed no excessive count during the following 15 seconds.
+
+The drill is documented in:
+
+```text
+docs/runbooks/taskmanager-checkpoint-recovery.md
+```
+
+This is manual evidence for a specific TaskManager-failure scenario.
+
+It is not:
+
+- An automated recovery suite
+- A JobManager or full-cluster disaster-recovery proof
+- A skip-rate recovery proof
+- An end-to-end exactly-once guarantee
+
+Checkpoint durability across broader container/host failures must not be
+inferred from this drill.
+
+## 20. Kafka topology
+
+| Default topic | Purpose |
+|---|---|
+| `interaction-events.v1` | Raw events |
+| `interaction-events.validated.v1` | Validated events |
+| `interaction-events.rejected.v1` | Structured validation failures |
+| `features.user-play-count-1h.v1` | Play-count updates |
+| `interaction-events.user-play-count-1h.late.v1` | Play-count late output |
+| `features.user-skip-rate-24h.v1` | Skip-rate updates |
+| `interaction-events.user-skip-rate-24h.late.v1` | Skip-rate late output |
+| `interaction-events.replay.<run-name>.v1` | Dedicated historical replay input |
+
+Job arguments support isolated input/output topic overrides.
+
+## 21. Local infrastructure and deployment
 
 Docker Compose provides:
 
 - Kafka in KRaft mode
 - Flink JobManager
 - Flink TaskManager
-- Redis
+- Redis with append-only persistence enabled
 
-Kafka is exposed locally on:
+Local endpoints:
 
-```text
-127.0.0.1:9092
-```
+| Service | Endpoint |
+|---|---|
+| Kafka | `127.0.0.1:9092` |
+| Flink UI / REST | `127.0.0.1:8081` |
+| Redis | `127.0.0.1:6379` |
 
-Redis is exposed locally on:
+Kafka's internal container endpoint is `kafka:29092`.
 
-```text
-127.0.0.1:6379
-```
+Auto-topic creation is disabled.
 
-The Flink UI is exposed locally on:
+The TaskManager is configured with two task slots.
+Feature jobs use parallelism one.
 
-```text
-127.0.0.1:8081
-```
+### Image and code distribution
 
-Kafka auto-topic creation is disabled. Topics must be created explicitly.
+The custom Flink image contains:
 
-## Testing strategy
+- Flink 1.20.3
+- Python 3.11
+- PyFlink
+- Kafka connector
+- The installed project package
 
-The project separates unit correctness from infrastructure integration.
+The host `jobs/` directory is mounted read-only into Flink containers.
 
-### Unit tests
+Changing a mounted job script does not by itself require an image rebuild.
+Changes to installed `src/` package code require rebuilding/redeploying the
+image when that new package code is needed inside Flink containers.
 
-Unit tests verify:
+The current Redis materializers run through the local Python environment
+in the demonstrated workflows.
 
-- Event contract validation
-- JSON routing and rejection behavior
-- Right-closed window mapping
-- Reference feature counting
-- Duplicate and conflict semantics
-- Arrival-order admission policy
-- Redis write guards
-- Kafka-to-Redis materialization behavior with fakes
+### Security boundary
 
-Unit tests do not require Docker, Kafka, or Redis.
+This is a local development stack, not a hardened production deployment.
 
-### Integration tests
+Kafka uses plaintext listeners. The Compose configuration does not establish
+production authentication, authorization, encrypted service traffic, or
+managed secret handling.
 
-Integration tests verify real behavior across:
+Local port binding reduces exposure but is not a substitute for a production
+security design.
 
-- Kafka topics
-- Flink jobs
-- Redis
-- Docker Compose services
+## 22. Testing strategy
 
-They cover:
-
-- Validation routing
-- Golden fixture feature values
-- Late-event correction
-- Duplicate suppression
-- Too-late event routing
-- Redis feature round trips
-- Redis concurrency and retry behavior
-
-Integration tests are excluded from the default pytest run through:
-
-```toml
-addopts = "-m 'not integration'"
-```
-
-They can be executed explicitly with:
+### Standard local checks
 
 ```bash
-.venv/bin/python -m pytest -m integration
+make check
 ```
 
-## Correctness boundaries
+The standard suite runs lint, formatting checks, and tests excluding the
+`integration` marker.
 
-The current implementation provides strong guarantees for the tested local
-system, but it does not claim unlimited production guarantees.
+Unit tests cover:
 
-Explicitly supported:
+- Event and feature payload contracts
+- JSON routing
+- Right-closed timestamp mapping
+- Deterministic feature references
+- Identity conflicts
+- Simplified admission and reconciliation
+- Snapshot semantics and verification
+- Skip-rate count-vector ordering
+- Materializer behavior with fakes
 
-- Event-time feature computation
-- At-least-once Kafka delivery with logical deduplication
-- Late correction within the allowed-lateness window
-- Explicit routing of too-late events
-- Guarded Redis writes
-- Bounded replay
-- Reference parity for the tested feature
+A green standard run does not mean infrastructure integration tests ran.
 
-Explicitly not claimed:
+### Explicit integration checks
 
-- Exactly-once end-to-end processing
-- Unlimited replay protection beyond the 24-hour deduplication TTL
-- Automatic recovery from every Flink failure mode
-- Multi-partition Redis materialization
-- General-purpose feature revision or retraction semantics
-- Historical availability at every past observation time
+Examples:
 
-These boundaries are intentional. The project favors precise, testable
-guarantees over vague production claims.
+```bash
+.venv/bin/python -m pytest \
+  -m integration \
+  tests/integration/test_user_skip_rate_job.py -v -s -x
+```
 
-## Module responsibilities
+```bash
+.venv/bin/python -m pytest \
+  -m integration \
+  tests/integration/test_redis_skip_rate_store.py -v -x
+```
 
-| Module | Responsibility |
+```bash
+.venv/bin/python -m pytest \
+  -m integration \
+  tests/integration/test_skip_rate_materialization.py -v -s -x
+```
+
+Integration tests have different prerequisites. Some use existing jobs;
+others create isolated topics and submit their own job.
+
+The entire integration directory must not be described as a one-command,
+self-provisioning suite without verifying those prerequisites.
+
+### Skip-rate Flink evidence
+
+The eight isolated cases cover:
+
+- Late corrections and duplicate safety
+- One microsecond before the lower boundary
+- The excluded lower boundary
+- One microsecond inside the lower boundary
+- The included upper boundary
+- One microsecond after the upper boundary
+- Zero denominator with non-contributing events
+- Too-late routing after all assigned windows expire
+
+Each case creates dedicated topics and submits its own job.
+The cleanup path requests cancellation of the identified job.
+
+Topics are retained for diagnosis.
+
+### Redis and materializer evidence
+
+Real Redis tests cover:
+
+- Round trips and missing users
+- Increasing and decreasing rates
+- Window ordering and zero replacement
+- Idempotent/stale updates
+- Incomparable count conflicts
+- Invalid stored payload protection
+- A real concurrent-write conflict and retry
+
+Materializer tests separately cover fake-client control flow and real
+Kafka-to-Redis operation.
+
+Test counts belong to dated verification output rather than permanent
+architecture guarantees.
+
+A successful GitHub check must not be interpreted as proof that every
+separately executed integration test ran in CI.
+
+## 23. Module responsibilities
+
+| Module or path | Responsibility |
 |---|---|
-| `contracts/events.py` | Defines and validates `InteractionEventV1` |
-| `contracts/routing.py` | Separates valid events from structured rejections |
-| `contracts/feature_time.py` | Maps event time to Flink window-assignment timestamps |
-| `reference/admission.py` | Simplified arrival-order admission reference; not an exact Flink sliding-window simulation |
-| `reference/user_play_count.py` | Defines the deterministic feature reference |
-| `jobs/validate_and_route_events.py` | Runs the Kafka validation job |
-| `jobs/user_play_count_1h.py` | Runs the Flink feature job |
-| `materialize.py` | Materializes Kafka feature updates into Redis |
-| `online_store.py` | Defines the feature contract and guarded Redis store |
-| `replay.py` | Adapts FeatureForge Parquet events for Kafka replay |
+| `contracts/events.py` | Validates interaction events |
+| `contracts/routing.py` | Structured validation routing |
+| `contracts/feature_time.py` | Right-closed timestamp mapping |
+| `contracts/user_skip_rate.py` | Skip-rate payload and update decision |
+| `reference/user_play_count.py` | Play-count reference and shared identity error |
+| `reference/user_skip_rate.py` | Skip-rate reference |
+| `reference/admission.py` | Simplified arrival-order admission policy |
+| `reference/snapshot_parity.py` | Source/snapshot reference comparison |
+| `reference/reconciliation.py` | Late-output reconciliation |
+| `jobs/validate_and_route_events.py` | Validation job |
+| `jobs/user_play_count_1h.py` | Play-count job |
+| `jobs/user_skip_rate_24h.py` | Skip-rate job |
+| `online_store.py` | Play-count payload and Redis store |
+| `skip_rate_store.py` | Skip-rate Redis store |
+| `materialize.py` | Play-count materializer |
+| `materialize_skip_rate.py` | Skip-rate materializer |
+| `replay.py` | Project 1 source adapter |
+| `snapshot.py` | Play-count snapshot support |
+| `scripts/export_replay_snapshot.py` | Snapshot export command |
+| `scripts/verify_kafka_redis.py` | Play-count Kafka/Redis verification |
+| `scripts/verify_source_snapshot.py` | Source/snapshot verification |
+| `scripts/reconcile_source_snapshot.py` | Reconciliation command |
+| `scripts/create_replay_topics.py` | Guarded replay-topic setup |
 
-## Extension path
+Some feature-specific pipeline structure is intentionally duplicated.
+A general feature compiler or universal sink abstraction is not claimed.
 
-The architecture is designed to grow without changing its core principles.
+## 24. Explicit correctness boundaries
 
-Natural next steps include:
+Supported within the demonstrated scope:
 
-- Adding more event-time features behind the same contract and reference pattern.
-- Introducing feature-specific late-event policies.
-- Adding offline snapshots and online/offline parity checks.
-- Expanding Redis materialization to multiple partitions safely.
-- Adding checkpoint-recovery integration tests.
-- Introducing schema-registry-based contract governance.
-- Adding observability for lag, rejected records, late events, and materialization outcomes.
+- Validated event contracts
+- Right-closed event-time windows
+- Finite-horizon logical deduplication
+- Tested late corrections
+- Explicit all-windows-too-late routing
+- Feature-specific guarded Redis writes
+- Single-partition materialization
+- Bounded staged replay
+- Play-count snapshots and declared consistency checks
+- A documented manual TaskManager recovery scenario
 
-Each extension should preserve the same rule:
+Not claimed:
 
-> Define the contract, define the reference, test the semantics, then add the
-> infrastructure.
+- End-to-end exactly-once processing
+- Unlimited duplicate or replay protection
+- General retractions or arbitrary feature revisions
+- Repair of inflated counts
+- Equivalence of independent runs sharing one namespace
+- Complete Spark/Flink parity
+- Historical online availability or leakage-safe training retrieval
+- Canonical Project 1 offline-store compatibility
+- Skip-rate snapshots or skip-rate recovery
+- A combined skip-rate events-to-Flink-to-Redis proof
+- Multi-partition materialization
+- Production-scale performance or high availability
+- Deployed monitoring, schema-registry governance, or AWS production operation
+- A deployed Project 3 training workflow
+
+## 25. Remaining extension path
+
+Next correctness and product work includes:
+
+1. A combined skip-rate events-to-Flink-to-Redis verification.
+2. A declared skip-rate snapshot contract and tested consolidation policy.
+3. Additional feature implementations with explicit references.
+4. A leakage-safe label contract and training handoff.
+5. Declared batch-stream parity over matching feature/time semantics.
+6. Practitioner-facing specs, CLI, generated catalog, and notebook.
+7. Operational metrics, dashboards, thresholds, and additional runbooks.
+8. Broader failure/recovery evidence where useful.
+9. Reproducible clean-clone demo and release documentation.
+10. An honest local-to-AWS production mapping.
+
+Each extension follows the same rule:
+
+> Define the contract, define the reference, test the semantics,
+> then connect and verify the infrastructure.

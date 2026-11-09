@@ -45,6 +45,7 @@ already deployed workflow.
 - Deterministic Python feature references
 - Guarded Kafka-to-Redis materialization
 - Feature-specific same-window update policies
+- A verified skip-rate feature-job-to-Redis path using actual Flink output
 - Bounded historical replay
 - Play-count Parquet snapshots and consistency reports
 - Source-to-snapshot verification and late-output reconciliation
@@ -64,13 +65,28 @@ feature, execution path, and scenario.
 | Play-count materialization | Kafka/Redis verification and Redis tests | Single-partition append-only count semantics |
 | Skip-rate Redis store | Policy tests and twelve Redis integration cases | Componentwise count ordering within a consistent run |
 | Skip-rate materializer | Thirteen unit tests and a real Kafka-to-Redis integration test | Controlled feature payloads published directly to Kafka |
+| Skip-rate feature job to Redis | Isolated integration test using actual Flink output, late corrections, duplicates, and output replay | Starts at feature-job input; excludes upstream validation and cross-project integration |
 | Historical snapshots | Play-count Parquet export and Redis comparison | Bounded, run-scoped artifact |
 | Source reconciliation | Source-derived count/coverage checks and verified late output | Declared play-count replay scope |
 | Checkpoint recovery | Manual TaskManager failure drill | Specific play-count scenario |
 
-The skip-rate Flink path and Kafka-to-Redis path have been tested separately.
-A single combined interaction-events-to-Flink-to-Redis skip-rate execution is
-not yet claimed.
+The skip-rate feature-job-to-Redis path has been verified in a single
+integration run:
+
+```text
+Interaction events → Flink → Feature Kafka topic → Materializer → Redis lookup
+```
+
+The test checks initial values, decreasing and increasing late corrections,
+duplicate delivery with a distinct positive probe, and replay of the actual
+Flink output through a fresh materializer consumer group.
+
+Redis rates are compared with the Python reference at the stored observation
+time. Both underlying counts are checked explicitly.
+
+This proof starts at the feature-job input. It does not include the upstream
+validation stage, Project 1 source integration, Project 3 consumption,
+skip-rate snapshots, or checkpoint recovery.
 
 ## Features
 
@@ -193,6 +209,9 @@ Snapshot/Redis comparison and source reconciliation
 
 The diagram describes the implemented component relationships.
 It does not imply that every end-to-end combination has already been tested.
+
+The combined skip-rate proof covers the feature-job input through Redis.
+Validation and cross-project boundaries have separate evidence scopes.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for state lifecycle, time semantics,
 write policies, replay boundaries, and remaining work.
@@ -344,9 +363,9 @@ Play-count corrections can increase the count.
 Skip-rate corrections can increase or decrease the rate:
 
 ```text
-1 play + 1 skip  -> 0.5
-2 plays + 1 skip -> 1/3
-2 plays + 2 skips -> 0.5
+1 play + 1 skip    -> 0.5
+2 plays + 1 skip   -> 1/3
+2 plays + 2 skips  -> 0.5
 ```
 
 A decreasing rate is not necessarily stale.
@@ -668,6 +687,57 @@ This test publishes controlled feature payloads directly to Kafka and verifies:
 
 It does not start Flink.
 
+### Combined skip-rate feature-job-to-Redis test
+
+```bash
+.venv/bin/python -m pytest \
+  -m integration \
+  tests/integration/test_skip_rate_flink_to_redis.py \
+  -v -s -x
+```
+
+This test:
+
+1. Creates dedicated input, feature-output, and late-output topics.
+2. Submits the actual skip-rate Flink job.
+3. Publishes interaction events directly to the feature-job input.
+4. Observes the actual Flink output in Kafka.
+5. Runs the real bounded materializer against that output.
+6. Reads Redis and checks counts, rate, and window metadata.
+7. Repeats the process after late corrections and duplicate delivery.
+8. Replays the retained Flink output through a fresh materializer group.
+9. Cleans up its Redis namespace and requests job cancellation.
+
+Verified states:
+
+| Phase | Plays | Skips | Rate |
+|---|---:|---:|---:|
+| Initial output | 1 | 1 | 0.5 |
+| Additional allowed-late play | 2 | 1 | 1/3 |
+| Additional allowed-late skip | 2 | 2 | 0.5 |
+| Repeated events plus a distinct play | 3 | 2 | 0.4 |
+
+The test observes the target window for an additional 15 seconds after the
+final duplicate/probe phase.
+
+Redis stores the latest accepted window, which is not assumed to be identical
+to the target window used by the Kafka-output assertions. The reference rate
+is calculated at the actual stored observation time.
+
+Replaying the same Flink output preserves the final Redis feature.
+
+The recorded local run passed in 37.31 seconds and successfully cancelled its
+test job.
+
+This proof excludes:
+
+- The upstream validation job
+- Project 1 source integration
+- Project 3 feature consumption
+- Skip-rate snapshots
+- Checkpoint recovery
+- End-to-end exactly-once processing
+
 ### Other integration tests
 
 Other integration tests cover validation routing, play-count computation, and
@@ -693,8 +763,7 @@ Job scripts live under `jobs/` and are mounted into Flink containers at:
 /opt/flink/jobs
 ```
 
-They are submitted through the Flink CLI, not through nonexistent
-`featureforge_stream.jobs.*` Python modules.
+They are submitted through the Flink CLI.
 
 ### Create the default topics
 
@@ -1166,6 +1235,10 @@ featureforge-stream/
 ├── tests/
 │   ├── unit/
 │   └── integration/
+│       ├── test_user_skip_rate_job.py
+│       ├── test_redis_skip_rate_store.py
+│       ├── test_skip_rate_materialization.py
+│       └── test_skip_rate_flink_to_redis.py
 ├── fixtures/
 ├── docs/
 │   ├── adr/
@@ -1211,10 +1284,13 @@ This project does not claim:
 - Historical online availability or leakage-safe training retrieval
 - Automatic Project 1 offline-store compatibility
 - Skip-rate snapshots or skip-rate recovery
-- A combined skip-rate events-to-Flink-to-Redis proof
+- A single combined validation-to-Redis or three-project integration proof
 - Recovery from every failure mode
 - Production-scale performance, security, or availability
 - A deployed downstream ML workflow
+
+The combined skip-rate feature-job-to-Redis proof does not remove these
+boundaries.
 
 The 24-hour skip-rate window uses a one-minute slide, assigning an event to
 1,440 windows. This is a deliberate local correctness configuration, not a
@@ -1222,7 +1298,6 @@ production performance claim.
 
 ## Remaining work
 
-- Combined skip-rate events-to-Flink-to-Redis verification
 - Skip-rate snapshot contract and consolidation policy
 - Remaining planned features
 - Leakage-safe label contract and explicit training handoff
@@ -1230,8 +1305,12 @@ production performance claim.
 - Practitioner specs, CLI, generated catalog, and notebook
 - Operational metrics, dashboards, and additional runbooks
 - Additional recovery evidence where useful
+- Broader validation-to-serving and cross-repository integration checks
 - Clean-clone demo and release packaging
 - Documented local-to-AWS production mapping
+
+The isolated skip-rate feature-job-to-Redis verification is complete.
+It is no longer an open implementation milestone.
 
 ## Roadmap alignment
 

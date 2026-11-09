@@ -28,13 +28,34 @@ Different components have different proof boundaries.
 | Play-count online materialization | Kafka-to-Redis verification and Redis tests | Single-partition output and guarded append-only counts |
 | Skip-rate online store | Payload/policy tests and twelve real Redis integration cases | Componentwise count ordering within a consistent run namespace |
 | Skip-rate materialization | Materializer unit tests and a real Kafka-to-Redis integration test | Controlled feature payloads published directly to Kafka |
+| Combined skip-rate feature job to Redis | Isolated integration test using actual Flink output, late corrections, duplicates, and output replay | Starts at feature-job input; excludes upstream validation and cross-project integration |
 | Play-count historical snapshots | Versioned Parquet export and snapshot-to-online verification | Bounded, run-scoped artifact |
 | Source-to-snapshot verification | Independent source comparison, coverage checks, and late-output reconciliation | Declared play-count snapshot scope |
 | TaskManager recovery | Documented manual play-count recovery drill | Specific local failure scenario |
-| Combined skip-rate pipeline | Flink and materialization paths tested separately | No single joined events-to-Flink-to-Redis proof claimed yet |
 
 The presence of a component does not imply that every possible combination
 of components has been tested together.
+
+The combined skip-rate proof covers:
+
+```text
+Interaction events
+        |
+        v
+Skip-rate Flink job
+        |
+        v
+Actual feature output in Kafka
+        |
+        v
+Skip-rate materializer
+        |
+        v
+Redis lookup checked against the Python reference
+```
+
+It does not include the upstream validation job, Project 1 source integration,
+Project 3 consumption, skip-rate snapshots, or checkpoint recovery.
 
 ## 2. System overview
 
@@ -103,12 +124,16 @@ consumer group, and operator identifiers.
 Tests and historical runs can override topic names to isolate state and
 watermark progression.
 
+The diagram describes component relationships, not a claim that the complete
+three-project system has already passed one joined acceptance test.
+
 ## 3. Core design principles
 
 - Event time defines feature-window membership.
 - Contracts are validated explicitly.
 - Logical identity and receipt metadata are separate concepts.
 - Reference correctness and distributed execution are tested separately.
+- Connected components also require joined integration evidence.
 - Late corrections are part of normal feature computation.
 - Duplicate suppression has a finite, documented retention horizon.
 - Online update rules are feature-specific.
@@ -170,6 +195,10 @@ interaction-events.replay.
 The adapter refuses to publish historical records directly to the normal
 live input topic.
 
+Project 2's current snapshot is a separately declared stream artifact.
+Compatibility with Project 1's canonical feature tables or a future Project 3
+consumer requires an explicit, tested adapter or consumer contract.
+
 ## 6. Event contract and validation
 
 Default raw input:
@@ -229,6 +258,10 @@ Validation failures are isolated per record.
 A feature job also parses its input against `InteractionEventV1`, but this is
 not a replacement for the validation job's structured rejection routing.
 Feature jobs normally consume validated input.
+
+The combined skip-rate integration test publishes contract-valid events
+directly to an isolated feature-job input topic. It does not exercise this
+upstream validation stage.
 
 ## 7. Logical event identity
 
@@ -422,6 +455,9 @@ Skip rates can move in either direction:
 | Additional skip | 2 | 2 | 0.5 |
 
 A lower rate is not necessarily a stale update.
+
+The combined skip-rate integration test verifies these corrections through
+the materializer into Redis, not only in the Kafka output.
 
 ### Late outputs
 
@@ -626,11 +662,11 @@ offset storage.
 There is no overall or idle-progress timeout. Bounded mode defines an
 offset boundary, not a wall-clock completion guarantee.
 
-### Proof boundaries
+### Controlled Kafka-to-Redis proof
 
 Play-count Kafka-to-Redis consistency has a separate verification path.
 
-Skip-rate Kafka-to-Redis integration checks:
+The dedicated skip-rate Kafka-to-Redis integration test checks:
 
 - Decreasing and increasing rates
 - Stored Redis values after each phase
@@ -640,9 +676,64 @@ Skip-rate Kafka-to-Redis integration checks:
 - Caught-up execution without writes
 - Replay of the same output with a fresh consumer group
 
-The skip-rate integration publishes controlled feature payloads directly
-to Kafka. A combined interaction-events-to-Flink-to-Redis execution is not
-claimed by that test.
+That test publishes controlled feature payloads directly to Kafka.
+It isolates materializer behavior without starting Flink.
+
+### Combined feature-job-to-Redis proof
+
+A separate integration test connects the actual components:
+
+```text
+tests/integration/test_skip_rate_flink_to_redis.py
+```
+
+It creates isolated topics, submits the skip-rate Flink job, publishes
+interaction events, observes real feature output, and materializes that
+output into an isolated Redis namespace.
+
+The test verifies:
+
+| Phase | Plays | Skips | Rate |
+|---|---:|---:|---:|
+| Initial state | 1 | 1 | 0.5 |
+| Allowed-late play | 2 | 1 | 1/3 |
+| Allowed-late skip | 2 | 2 | 0.5 |
+| Repeated events plus a distinct play | 3 | 2 | 0.4 |
+
+The final duplicate/probe phase is followed by a 15-second observation of
+the target Kafka window.
+
+After each phase, the materializer processes retained Flink output and the
+test reads Redis through `RedisUserSkipRateStore`.
+
+Redis stores the latest accepted observation window. The test does not assume
+that this is exactly the same window used by the target Kafka assertions.
+
+It checks the stored counts, validates the 24-hour window metadata, and
+computes the Python reference rate at the stored observation time.
+
+Finally, it replays the retained Flink output using a fresh materializer
+consumer group and checks that the final Redis feature remains unchanged.
+
+The recorded local execution passed in 37.31 seconds.
+The test job was successfully cancelled.
+
+### Combined-proof boundary
+
+This is a feature-job-input-to-Redis integration proof.
+
+It does not establish:
+
+- Upstream validation-to-Redis integration
+- Project 1 source-to-skip-rate integration
+- Project 3 feature consumption
+- Skip-rate snapshot consistency
+- Checkpoint recovery
+- End-to-end exactly-once processing
+- Performance or freshness SLO compliance
+
+The materializer is invoked in bounded phases during the test.
+This is not a continuous-production-load or crash-injection test.
 
 ## 16. Historical replay
 
@@ -667,6 +758,9 @@ upstream range.
 
 Fresh topics and namespaces do not by themselves establish deterministic
 late-event admission; watermark scheduling remains relevant.
+
+Replaying retained feature output through a materializer is not the same
+operation as recomputing that output from source events.
 
 ### Kafka timestamps and retention
 
@@ -840,6 +934,9 @@ It is not:
 Checkpoint durability across broader container/host failures must not be
 inferred from this drill.
 
+The combined skip-rate integration test performs normal execution and cleanup.
+It does not inject a failure or restore state from a checkpoint.
+
 ## 20. Kafka topology
 
 | Default topic | Purpose |
@@ -898,6 +995,9 @@ image when that new package code is needed inside Flink containers.
 The current Redis materializers run through the local Python environment
 in the demonstrated workflows.
 
+The combined skip-rate test submits Flink to the Compose runtime and invokes
+the real materializer from the host test process.
+
 ### Security boundary
 
 This is a local development stack, not a hardened production deployment.
@@ -936,7 +1036,7 @@ A green standard run does not mean infrastructure integration tests ran.
 
 ### Explicit integration checks
 
-Examples:
+Skip-rate Flink contract:
 
 ```bash
 .venv/bin/python -m pytest \
@@ -944,16 +1044,28 @@ Examples:
   tests/integration/test_user_skip_rate_job.py -v -s -x
 ```
 
+Skip-rate Redis store:
+
 ```bash
 .venv/bin/python -m pytest \
   -m integration \
   tests/integration/test_redis_skip_rate_store.py -v -x
 ```
 
+Controlled Kafka-to-Redis materialization:
+
 ```bash
 .venv/bin/python -m pytest \
   -m integration \
   tests/integration/test_skip_rate_materialization.py -v -s -x
+```
+
+Combined feature-job-to-Redis path:
+
+```bash
+.venv/bin/python -m pytest \
+  -m integration \
+  tests/integration/test_skip_rate_flink_to_redis.py -v -s -x
 ```
 
 Integration tests have different prerequisites. Some use existing jobs;
@@ -995,6 +1107,20 @@ Real Redis tests cover:
 Materializer tests separately cover fake-client control flow and real
 Kafka-to-Redis operation.
 
+### Joined integration evidence
+
+The combined skip-rate test verifies real component compatibility rather than
+assuming that separately tested stages work together.
+
+It checks both source-event duplicate handling in Flink and replay of actual
+feature output through the materializer.
+
+The test uses isolated Kafka topics and a unique Redis namespace.
+Cleanup removes that Redis namespace and requests cancellation of its job.
+
+This does not make the test a validation-stage, cross-repository, recovery,
+or exactly-once proof.
+
 Test counts belong to dated verification output rather than permanent
 architecture guarantees.
 
@@ -1028,6 +1154,7 @@ separately executed integration test ran in CI.
 | `scripts/verify_source_snapshot.py` | Source/snapshot verification |
 | `scripts/reconcile_source_snapshot.py` | Reconciliation command |
 | `scripts/create_replay_topics.py` | Guarded replay-topic setup |
+| `tests/integration/test_skip_rate_flink_to_redis.py` | Joined skip-rate feature-job-to-Redis proof |
 
 Some feature-specific pipeline structure is intentionally duplicated.
 A general feature compiler or universal sink abstraction is not claimed.
@@ -1043,6 +1170,8 @@ Supported within the demonstrated scope:
 - Explicit all-windows-too-late routing
 - Feature-specific guarded Redis writes
 - Single-partition materialization
+- A verified skip-rate feature-job-to-Redis path using actual Flink output
+- Replay of retained skip-rate output without changing the final Redis value
 - Bounded staged replay
 - Play-count snapshots and declared consistency checks
 - A documented manual TaskManager recovery scenario
@@ -1058,24 +1187,30 @@ Not claimed:
 - Historical online availability or leakage-safe training retrieval
 - Canonical Project 1 offline-store compatibility
 - Skip-rate snapshots or skip-rate recovery
-- A combined skip-rate events-to-Flink-to-Redis proof
+- A single joined upstream-validation-to-Redis proof
+- A complete three-repository integration proof
 - Multi-partition materialization
 - Production-scale performance or high availability
 - Deployed monitoring, schema-registry governance, or AWS production operation
 - A deployed Project 3 training workflow
 
+The completed feature-job-to-Redis test closes one integration boundary.
+It does not remove the other boundaries above.
+
 ## 25. Remaining extension path
+
+The isolated skip-rate feature-job-to-Redis verification is complete.
 
 Next correctness and product work includes:
 
-1. A combined skip-rate events-to-Flink-to-Redis verification.
-2. A declared skip-rate snapshot contract and tested consolidation policy.
-3. Additional feature implementations with explicit references.
-4. A leakage-safe label contract and training handoff.
-5. Declared batch-stream parity over matching feature/time semantics.
-6. Practitioner-facing specs, CLI, generated catalog, and notebook.
-7. Operational metrics, dashboards, thresholds, and additional runbooks.
-8. Broader failure/recovery evidence where useful.
+1. A declared skip-rate snapshot contract and tested consolidation policy.
+2. Additional feature implementations with explicit references.
+3. A leakage-safe label contract and training handoff.
+4. Declared batch-stream parity over matching feature/time semantics.
+5. Practitioner-facing specs, CLI, generated catalog, and notebook.
+6. Operational metrics, dashboards, thresholds, and additional runbooks.
+7. Broader failure/recovery evidence where useful.
+8. Validation-to-serving and cross-repository integration checks.
 9. Reproducible clean-clone demo and release documentation.
 10. An honest local-to-AWS production mapping.
 

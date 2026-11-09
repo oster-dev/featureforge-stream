@@ -725,6 +725,19 @@ of watermark decisions, Spark batch parity, or recovery.
 See [Source-to-Snapshot Verification V1](docs/contracts/source-snapshot-verification-v1.md)
 for contracts, evidence, and limitations.
 
+### TaskManager checkpoint-recovery drill
+
+A controlled local drill killed and restarted the TaskManager while keeping the
+JobManager and Kafka running. The same job restored from checkpoint 23.
+Repeating an original play and adding a new play produced the reference count 2,
+with no excessive count observed during the following fifteen seconds.
+
+This is a documented manual recovery drill, not an automated recovery suite or
+an end-to-end exactly-once guarantee.
+
+See [TaskManager Checkpoint Recovery](docs/runbooks/taskmanager-checkpoint-recovery.md)
+for the protocol, recorded evidence, and limitations.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

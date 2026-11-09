@@ -1,4 +1,4 @@
-"""Isolated live-job proof for skip-rate corrections and duplicate safety."""
+"""Isolated skip-rate window, correction, duplicate, and late-routing proofs."""
 
 import json
 import re
@@ -31,7 +31,49 @@ def flink_api(path: str) -> dict:
 
 
 @pytest.mark.integration
-def test_skip_rate_late_corrections_and_duplicate_safety() -> None:
+@pytest.mark.parametrize(
+    ("scenario", "offset", "expected_skips"),
+    [
+        pytest.param("corrections", None, None, id="late-corrections-and-duplicates"),
+        pytest.param(
+            "boundary",
+            timedelta(hours=-24, microseconds=-1),
+            0,
+            id="before-lower-boundary",
+        ),
+        pytest.param(
+            "boundary",
+            timedelta(hours=-24),
+            0,
+            id="at-excluded-lower-boundary",
+        ),
+        pytest.param(
+            "boundary",
+            timedelta(hours=-24, microseconds=1),
+            1,
+            id="just-inside-lower-boundary",
+        ),
+        pytest.param(
+            "boundary",
+            timedelta(0),
+            1,
+            id="at-included-upper-boundary",
+        ),
+        pytest.param(
+            "boundary",
+            timedelta(microseconds=1),
+            0,
+            id="after-upper-boundary",
+        ),
+        pytest.param("zero", None, None, id="zero-denominator"),
+        pytest.param("too_late", None, None, id="too-late-for-all-windows"),
+    ],
+)
+def test_skip_rate_stream_contract(
+    scenario: str,
+    offset: timedelta | None,
+    expected_skips: int | None,
+) -> None:
     from confluent_kafka import Consumer, Producer, TopicPartition
 
     overview = flink_api("overview")
@@ -213,6 +255,75 @@ def test_skip_rate_late_corrections_and_duplicate_safety() -> None:
                 break
             assert time.monotonic() < deadline, job
             time.sleep(1)
+
+        if scenario in {"boundary", "zero"}:
+            if scenario == "boundary":
+                assert offset is not None
+                timestamp = observation + offset
+                boundary_skip = InteractionEventV1.model_validate(
+                    {
+                        **initial_skip.model_dump(),
+                        "event_id": uuid4(),
+                        "event_time": timestamp,
+                    }
+                )
+                inputs = [initial_play, boundary_skip]
+                expected_plays = 1
+                assert expected_skips is not None
+                target_skips = expected_skips
+            else:
+                inputs = [
+                    event("impression", seconds_before=120),
+                    event("complete", seconds_before=90),
+                ]
+                expected_plays = 0
+                target_skips = 0
+
+            produce(sorted(inputs, key=lambda item: item.event_time) + [progress])
+            latest = wait_for_counts(expected_plays, target_skips, inputs)
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                record = next_target(0.5)
+                if record is not None:
+                    latest = record
+                    assert (record["play_count"], record["skip_count"]) == (
+                        expected_plays,
+                        target_skips,
+                    )
+
+            assert (latest["play_count"], latest["skip_count"]) == (expected_plays, target_skips)
+            assert flink_api(f"jobs/{job_id}")["state"] == "RUNNING"
+            return
+
+        if scenario == "too_late":
+            produce([initial_play, progress])
+            wait_for_counts(1, 0, [initial_play])
+
+            old_event = event("skip", seconds_before=26 * 60 * 60)
+            consumer.assign([TopicPartition(late_topic, 0, 0)])
+            produce([old_event])
+
+            deadline = time.monotonic() + 90
+            matched = None
+            while time.monotonic() < deadline:
+                message = consumer.poll(1.0)
+                if message is None:
+                    continue
+                assert message.error() is None, str(message.error())
+                record = json.loads(message.value())
+                original = InteractionEventV1.model_validate_json(record["raw_payload"])
+                if original.event_id == old_event.event_id:
+                    matched = record
+                    assert original == old_event
+                    break
+
+            assert matched is not None, f"No late output for event_id={old_event.event_id}"
+            assert matched["error_schema_version"] == "v1"
+            assert matched["feature_name"] == "user_skip_rate_24h"
+            assert matched["reason_code"] == "TOO_LATE_FOR_ALL_ASSIGNED_WINDOWS"
+            assert flink_api(f"jobs/{job_id}")["state"] == "RUNNING"
+            return
 
         logical_events = [initial_play, initial_skip]
         produce([*logical_events, progress])
